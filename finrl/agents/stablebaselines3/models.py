@@ -10,7 +10,7 @@ from stable_baselines3 import DDPG
 from stable_baselines3 import PPO
 from stable_baselines3 import SAC
 from stable_baselines3 import TD3
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 from stable_baselines3.common.noise import NormalActionNoise
 from stable_baselines3.common.noise import OrnsteinUhlenbeckActionNoise
 from stable_baselines3.common.vec_env import DummyVecEnv
@@ -112,13 +112,51 @@ class DRLAgent:
 
     @staticmethod
     def train_model(
-        model, tb_log_name, total_timesteps=5000
+        model, tb_log_name, 
+        total_timesteps=5000,
+        eval_env=None, 
+        eval_freq=10000,
+        best_model_save_path="./best_model"
     ):  # this function is static method, so it can be called without creating an instance of the class
-        model = model.learn(
-            total_timesteps=total_timesteps,
-            tb_log_name=tb_log_name,
-            callback=TensorboardCallback(),
-        )
+        """
+        Train the given model and optionally use an evaluation callback to 
+        select and save the best model during training.
+        
+        Parameters
+        ----------
+        model : RL model instance (e.g., PPO, A2C, etc.)
+        tb_log_name : str
+            Name for TensorBoard logs.
+        total_timesteps : int
+            Number of timesteps to train for.
+        eval_env : gym.Env or VecEnv, optional
+            Separate environment to evaluate the agent periodically.
+        eval_freq : int, optional
+            Evaluate the agent every `eval_freq` timesteps.
+        best_model_save_path : str, optional
+            Where to save the best model according to performance on eval_env.
+        """
+        # If we have an evaluation env, create the EvalCallback
+        if eval_env is not None:
+            eval_callback = EvalCallback(
+                eval_env,
+                best_model_save_path=best_model_save_path,
+                log_path=best_model_save_path,
+                eval_freq=eval_freq,
+                deterministic=True,
+                render=False
+            )
+            model = model.learn(
+                total_timesteps=total_timesteps,
+                tb_log_name=tb_log_name,
+                callback=[TensorboardCallback(), eval_callback],
+            )
+        else:
+            model = model.learn(
+                total_timesteps=total_timesteps,
+                tb_log_name=tb_log_name,
+                callback=TensorboardCallback(),
+            )
         return model
 
     @staticmethod
