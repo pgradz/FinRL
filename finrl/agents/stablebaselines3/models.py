@@ -1020,7 +1020,7 @@ class DRLEnsembleAgent:
             test_env=val_env,
             test_obs=val_obs,
         )
-        sharpe = self.get_validation_sharpe(i, model_name=model_name, self.seed)
+        sharpe = self.get_validation_sharpe(i, model_name=model_name, seed=self.seed)
         print(f"{model_name} Sharpe Ratio: ", sharpe)
         sharpe_list.append(sharpe)
         return model, sharpe_list, sharpe
