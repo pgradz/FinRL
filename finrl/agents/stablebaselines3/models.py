@@ -1008,6 +1008,7 @@ class DRLEnsembleAgent:
                     model_name=model_name,
                     mode="validation",
                     print_verbosity=self.print_verbosity,
+                    seed=self.seed
                 )
             ]
         )
