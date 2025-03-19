@@ -1040,8 +1040,6 @@ class DRLEnsembleAgent:
             "sac": SAC_model_kwargs,
             "td3": TD3_model_kwargs,
         }
-        # add seed to all models
-        kwargs = {key: {**value, "seed": self.seed} for key, value in kwargs.items()}
         # Model Sharpe Ratios
         model_dct = {k: {"sharpe_list": [], "sharpe": -1} for k in MODELS.keys()}
         
