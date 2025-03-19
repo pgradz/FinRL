@@ -936,6 +936,7 @@ class DRLEnsembleAgent:
                     mode="trade",
                     iteration=iter_num,
                     print_verbosity=self.print_verbosity,
+                    seed=self.seed
                 )
             ]
         )
@@ -950,7 +951,7 @@ class DRLEnsembleAgent:
                 last_state = trade_env.envs[0].render()
 
         df_last_state = pd.DataFrame({"last_state": last_state})
-        df_last_state.to_csv(f"results/last_state_{name}_{i}.csv", index=False)
+        df_last_state.to_csv(f"results/last_state_{name}_{i}_{self.seed}.csv", index=False)
         return last_state
 
     def _train_window(
