@@ -44,6 +44,7 @@ class StockTradingEnv(gym.Env):
         model_name="",
         mode="",
         iteration="",
+        seed=""
     ):
         self.day = day
         self.df = df
@@ -72,6 +73,7 @@ class StockTradingEnv(gym.Env):
         self.model_name = model_name
         self.mode = mode
         self.iteration = iteration
+        self.seed = seed
         # initalize state
         self.state = self._initiate_state()
 
@@ -91,6 +93,7 @@ class StockTradingEnv(gym.Env):
         ]  # the initial total asset is calculated by cash + sum (num_share_stock_i * price_stock_i)
         self.rewards_memory = []
         self.actions_memory = []
+        self.cash_memory = []
         self.state_memory = (
             []
         )  # we need sometimes to preserve the state in the middle of trading process
@@ -243,6 +246,8 @@ class StockTradingEnv(gym.Env):
             df_total_value["daily_return"] = df_total_value["account_value"].pct_change(
                 1
             )
+            df_total_value["cash"] = self.cash_memory
+            df_total_value['cash_share'] = df_total_value['cash'] / df_total_value['account_value']
             if df_total_value["daily_return"].std() != 0:
                 sharpe = (
                     (252**0.5)
@@ -266,26 +271,26 @@ class StockTradingEnv(gym.Env):
             if (self.model_name != "") and (self.mode != ""):
                 df_actions = self.save_action_memory()
                 df_actions.to_csv(
-                    "results/actions_{}_{}_{}.csv".format(
-                        self.mode, self.model_name, self.iteration
+                    "results/actions_{}_{}_{}_{}.csv".format(
+                        self.mode, self.model_name, self.iteration, self.seed
                     )
                 )
                 df_total_value.to_csv(
-                    "results/account_value_{}_{}_{}.csv".format(
-                        self.mode, self.model_name, self.iteration
+                    "results/account_value_{}_{}_{}_{}.csv".format(
+                        self.mode, self.model_name, self.iteration, self.seed
                     ),
                     index=False,
                 )
                 df_rewards.to_csv(
-                    "results/account_rewards_{}_{}_{}.csv".format(
-                        self.mode, self.model_name, self.iteration
+                    "results/account_rewards_{}_{}_{}_{}.csv".format(
+                        self.mode, self.model_name, self.iteration, self.seed
                     ),
                     index=False,
                 )
                 plt.plot(self.asset_memory, "r")
                 plt.savefig(
-                    "results/account_value_{}_{}_{}.png".format(
-                        self.mode, self.model_name, self.iteration
+                    "results/account_value_{}_{}_{}_{}.png".format(
+                        self.mode, self.model_name, self.iteration, self.seed
                     )
                 )
                 plt.close()
@@ -349,6 +354,7 @@ class StockTradingEnv(gym.Env):
             self.reward = end_total_asset - begin_total_asset
             self.rewards_memory.append(self.reward)
             self.reward = self.reward * self.reward_scaling
+            self.cash_memory.append(self.state[0])
             self.state_memory.append(
                 self.state
             )  # add current state in state_recorder for each step
@@ -391,6 +397,7 @@ class StockTradingEnv(gym.Env):
         self.rewards_memory = []
         self.actions_memory = []
         self.date_memory = [self._get_date()]
+        self.cash_memory = [self.initial_amount]
 
         self.episode += 1
 
