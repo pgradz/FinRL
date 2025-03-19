@@ -838,10 +838,10 @@ class DRLEnsembleAgent:
         return model
 
     @staticmethod
-    def get_validation_sharpe(iteration, model_name):
+    def get_validation_sharpe(iteration, model_name, seed):
         """Calculate Sharpe ratio based on validation results"""
         df_total_value = pd.read_csv(
-            f"results/account_value_validation_{model_name}_{iteration}.csv"
+            f"results/account_value_validation_{model_name}_{iteration}_{seed}.csv"
         )
         # If the agent did not make any transaction
         if df_total_value["daily_return"].var() == 0:
@@ -1020,7 +1020,7 @@ class DRLEnsembleAgent:
             test_env=val_env,
             test_obs=val_obs,
         )
-        sharpe = self.get_validation_sharpe(i, model_name=model_name)
+        sharpe = self.get_validation_sharpe(i, model_name=model_name, self.seed)
         print(f"{model_name} Sharpe Ratio: ", sharpe)
         sharpe_list.append(sharpe)
         return model, sharpe_list, sharpe
