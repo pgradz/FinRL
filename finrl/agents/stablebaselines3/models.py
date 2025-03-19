@@ -1011,8 +1011,8 @@ class DRLEnsembleAgent:
                 )
             ]
         )
-        val_env.seed(self.seed)
         val_obs = val_env.reset()
+        val_env.seed(self.seed)
         self.DRL_validation(
             model=model,
             test_data=validation,
