@@ -796,7 +796,7 @@ class DRLEnsembleAgent:
         policy="MlpPolicy",
         policy_kwargs=None,
         model_kwargs=None,
-        seed=None,
+        seed=0,
         verbose=1,
     ):
         if model_name not in MODELS:
@@ -973,7 +973,8 @@ class DRLEnsembleAgent:
 
         print(f"======{model_name} Training========")
         model = self.get_model(
-            model_name, self.train_env, policy="MlpPolicy", model_kwargs=model_kwargs
+            model_name, self.train_env, policy="MlpPolicy", model_kwargs=model_kwargs,
+            seed=self.seed
         )
         model = self.train_model(
             model,
