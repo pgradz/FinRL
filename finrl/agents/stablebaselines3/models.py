@@ -503,9 +503,11 @@ class DRLAgent:
         # We'll store them in lists of DataFrames, then concat at the end.
         all_account_memories = []
         all_actions_memories = []
+        last_state = []
 
         current_idx = start_idx
         iteration_no = 0
+        initial = True
 
         while current_idx < end_idx:
             iteration_no += 1
@@ -652,9 +654,9 @@ class DRLAgent:
                 break
 
             # 7) Reuse DRL_prediction => collects account_memory & actions_memory
-            trade_env_gym = env_constructor(trade_df, **env_kwargs)
-            account_mem, actions_mem = self.DRL_prediction(best_policy, trade_env_gym, deterministic=True)
-
+            trade_env_gym = env_constructor(trade_df, **env_kwargs, initial=initial, previous_state=last_state)
+            account_mem, actions_mem, last_state = self.DRL_prediction(best_policy, trade_env_gym, deterministic=True)
+            initial = False
             # We can store these in lists for later analysis.
             # Example: store them as dataframes with iteration info
             df_account = account_mem.copy()  # account_mem is presumably a DataFrame (depends on your env)
@@ -745,13 +747,14 @@ class DRLAgent:
             ):  # more descriptive condition for early termination to clarify the logic
                 account_memory = test_env.env_method(method_name="save_asset_memory")
                 actions_memory = test_env.env_method(method_name="save_action_memory")
+                last_state = test_env.envs[0].render()
             # add current state to state memory
             # state_memory=test_env.env_method(method_name="save_state_memory")
 
             if dones[0]:
                 print("hit end!")
                 break
-        return account_memory[0], actions_memory[0]
+        return account_memory[0], actions_memory[0], last_state
 
     @staticmethod
     def DRL_prediction_load_from_file(model_name, environment, cwd, deterministic=True):
