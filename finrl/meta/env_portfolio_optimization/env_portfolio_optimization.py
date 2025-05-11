@@ -89,6 +89,7 @@ class PortfolioOptimizationEnv(gym.Env):
         time_window=1,
         cwd="./",
         new_gym_api=False,
+        seed = ""
     ):
         """Initializes environment's instance.
 
@@ -138,6 +139,7 @@ class PortfolioOptimizationEnv(gym.Env):
         self._valuation_feature = valuation_feature
         self._cwd = Path(cwd)
         self._new_gym_api = new_gym_api
+        self.seed = seed
 
         # results file
         self._results_file = self._cwd / "results" / "rl"
@@ -196,6 +198,7 @@ class PortfolioOptimizationEnv(gym.Env):
 
         self._portfolio_value = self._initial_amount
         self._terminal = False
+        self._seed(self.seed)
 
     def step(self, actions):
         """Performs a simulation step.
