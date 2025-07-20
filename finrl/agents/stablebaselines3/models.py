@@ -5,6 +5,9 @@ import time
 import os
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
+import gymnasium as gym
 from stable_baselines3 import A2C
 from stable_baselines3 import DDPG
 from stable_baselines3 import PPO
@@ -15,6 +18,10 @@ from stable_baselines3.common.noise import NormalActionNoise
 from stable_baselines3.common.noise import OrnsteinUhlenbeckActionNoise
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.utils import set_random_seed
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.torch_layers import MlpExtractor
+from typing import Callable
 
 from finrl import config
 from finrl.meta.env_stock_trading.env_stocktrading import StockTradingEnv
@@ -53,6 +60,627 @@ class TensorboardCallback(BaseCallback):
                 print("Original Error:", error)
                 print("Inner Error:", inner_error)
         return True
+
+
+
+class CustomLSTM(BaseFeaturesExtractor):
+    def __init__(self, observation_space: gym.spaces.Box, lstm_hidden_size=64, num_layers=1, dropout=0.0):
+        """
+        Custom LSTM feature extractor for Stable-Baselines3.
+        
+        Args:
+            observation_space: The observation space (should be Box with shape compatible with LSTM)
+            lstm_hidden_size: Hidden size of the LSTM layer
+            num_layers: Number of LSTM layers
+            dropout: Dropout rate for LSTM (if num_layers > 1)
+        """
+        super().__init__(observation_space, features_dim=lstm_hidden_size)
+
+        self.lstm_hidden_size = lstm_hidden_size
+        self.num_layers = num_layers
+        
+        # Handle different observation space shapes
+        obs_shape = observation_space.shape
+        if len(obs_shape) == 1:
+            # Flat observation space - treat as single timestep with all features
+            self.input_size = obs_shape[0]
+            self.sequence_length = 1
+            self.reshape_needed = True
+        elif len(obs_shape) == 2:
+            # 2D observation space (sequence_length, input_size)
+            self.sequence_length = obs_shape[0]
+            self.input_size = obs_shape[1]
+            self.reshape_needed = False
+        else:
+            raise ValueError(f"Unsupported observation space shape: {obs_shape}")
+
+        self.lstm = nn.LSTM(
+            input_size=self.input_size,
+            hidden_size=lstm_hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            batch_first=True
+        )
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        """
+        Extract features using LSTM.
+        
+        Args:
+            observations: Input tensor of shape (batch_size, *obs_shape)
+            
+        Returns:
+            Features tensor of shape (batch_size, lstm_hidden_size)
+        """
+        batch_size = observations.shape[0]
+        
+        # Ensure we have the right shape for LSTM: (batch_size, seq_len, input_size)
+        if self.reshape_needed:
+            # Reshape flat observations to (batch_size, 1, input_size)
+            observations = observations.view(batch_size, 1, self.input_size)
+        elif observations.dim() == 2:
+            # Add sequence dimension if missing
+            observations = observations.view(batch_size, self.sequence_length, self.input_size)
+        
+        # Initialize hidden states
+        h_0 = torch.zeros(self.num_layers, batch_size, self.lstm_hidden_size, 
+                         device=observations.device, dtype=observations.dtype)
+        c_0 = torch.zeros(self.num_layers, batch_size, self.lstm_hidden_size,
+                         device=observations.device, dtype=observations.dtype)
+        
+        # Forward pass through LSTM
+        lstm_out, (h_n, c_n) = self.lstm(observations, (h_0, c_0))
+        
+        # Return the last hidden state (or final output)
+        # Option 1: Use last output
+        features = lstm_out[:, -1, :]  # Shape: (batch_size, lstm_hidden_size)
+        
+        # Option 2 (alternative): Use final hidden state
+        # features = h_n[-1, :, :]  # Shape: (batch_size, lstm_hidden_size)
+        
+        return features
+
+
+class MultiHeadSelfAttention(nn.Module):
+    """Multi-Head Self-Attention module for Transformer-based feature extraction"""
+    
+    def __init__(self, embed_dim, num_heads, dropout=0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        
+        self.q_linear = nn.Linear(embed_dim, embed_dim)
+        self.k_linear = nn.Linear(embed_dim, embed_dim)
+        self.v_linear = nn.Linear(embed_dim, embed_dim)
+        self.out_linear = nn.Linear(embed_dim, embed_dim)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.scale = torch.sqrt(torch.FloatTensor([self.head_dim]))
+        
+    def forward(self, x):
+        batch_size, seq_len, embed_dim = x.shape
+        
+        # Linear transformations and split into heads
+        Q = self.q_linear(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_linear(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_linear(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Attention calculation
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale.to(x.device)
+        attention_weights = torch.softmax(scores, dim=-1)
+        attention_weights = self.dropout(attention_weights)
+        
+        # Apply attention to values
+        attended = torch.matmul(attention_weights, V)
+        
+        # Concatenate heads and apply output projection
+        attended = attended.transpose(1, 2).contiguous().view(batch_size, seq_len, embed_dim)
+        output = self.out_linear(attended)
+        
+        return output
+
+
+class CustomTransformer(BaseFeaturesExtractor):
+    def __init__(self, observation_space: gym.spaces.Box, embed_dim=128, num_heads=8, 
+                 num_layers=2, dropout=0.1, max_seq_len=100):
+        """
+        Transformer-based feature extractor for financial time series.
+        
+        Args:
+            observation_space: The observation space
+            embed_dim: Embedding dimension (must be divisible by num_heads)
+            num_heads: Number of attention heads
+            num_layers: Number of transformer layers
+            dropout: Dropout rate
+            max_seq_len: Maximum sequence length for positional encoding
+        """
+        super().__init__(observation_space, features_dim=embed_dim)
+        
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        
+        # Handle different observation space shapes
+        obs_shape = observation_space.shape
+        if len(obs_shape) == 1:
+            # Flat observation space - treat as single timestep
+            self.input_size = obs_shape[0]
+            self.sequence_length = 1
+            self.reshape_needed = True
+        elif len(obs_shape) == 2:
+            # 2D observation space (sequence_length, input_size)
+            self.sequence_length = obs_shape[0]
+            self.input_size = obs_shape[1]
+            self.reshape_needed = False
+        else:
+            raise ValueError(f"Unsupported observation space shape: {obs_shape}")
+        
+        # Input projection to embedding dimension
+        self.input_projection = nn.Linear(self.input_size, embed_dim)
+        
+        # Positional encoding
+        self.positional_encoding = nn.Parameter(
+            torch.randn(max_seq_len, embed_dim) * 0.1
+        )
+        
+        # Transformer layers
+        self.transformer_layers = nn.ModuleList([
+            nn.ModuleDict({
+                'attention': MultiHeadSelfAttention(embed_dim, num_heads, dropout),
+                'norm1': nn.LayerNorm(embed_dim),
+                'ffn': nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim * 4),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(embed_dim * 4, embed_dim),
+                    nn.Dropout(dropout)
+                ),
+                'norm2': nn.LayerNorm(embed_dim)
+            })
+            for _ in range(num_layers)
+        ])
+        
+        # Output aggregation
+        self.output_aggregation = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),  # Global average pooling
+            nn.Flatten(),
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through transformer.
+        
+        Args:
+            observations: Input tensor of shape (batch_size, *obs_shape)
+            
+        Returns:
+            Features tensor of shape (batch_size, embed_dim)
+        """
+        batch_size = observations.shape[0]
+        
+        # Reshape observations if needed
+        if self.reshape_needed:
+            observations = observations.view(batch_size, 1, self.input_size)
+        elif observations.dim() == 2:
+            observations = observations.view(batch_size, self.sequence_length, self.input_size)
+        
+        seq_len = observations.shape[1]
+        
+        # Project to embedding dimension
+        x = self.input_projection(observations)  # (batch_size, seq_len, embed_dim)
+        
+        # Add positional encoding
+        if seq_len <= self.positional_encoding.shape[0]:
+            pos_encoding = self.positional_encoding[:seq_len].unsqueeze(0)
+            x = x + pos_encoding
+        
+        # Apply transformer layers
+        for layer in self.transformer_layers:
+            # Self-attention with residual connection
+            attended = layer['attention'](x)
+            x = layer['norm1'](x + attended)
+            
+            # Feed-forward with residual connection
+            ffn_output = layer['ffn'](x)
+            x = layer['norm2'](x + ffn_output)
+        
+        # Aggregate sequence into single feature vector
+        # Transpose for adaptive pooling: (batch_size, embed_dim, seq_len)
+        x = x.transpose(1, 2)
+        features = self.output_aggregation(x)
+        
+        return features
+
+
+
+class CustomCNN(BaseFeaturesExtractor):
+    def __init__(self, observation_space: gym.spaces.Box, output_dim=128, 
+                 num_filters=[32, 64, 128], kernel_sizes=[3, 3, 3], dropout=0.1):
+        """
+        1D CNN feature extractor for time series data.
+        """
+        super().__init__(observation_space, features_dim=output_dim)
+        
+        self.output_dim = output_dim
+        
+        # Handle different observation space shapes
+        obs_shape = observation_space.shape
+        if len(obs_shape) == 1:
+            # Flat observation space - treat as single timestep
+            self.input_size = obs_shape[0]
+            self.sequence_length = 1
+            self.reshape_needed = True
+        elif len(obs_shape) == 2:
+            # 2D observation space (sequence_length, input_size)
+            self.sequence_length = obs_shape[0]
+            self.input_size = obs_shape[1]
+            self.reshape_needed = False
+        else:
+            raise ValueError(f"Unsupported observation space shape: {obs_shape}")
+        
+        # Build CNN layers
+        layers = []
+        in_channels = self.input_size
+        
+        for i, (filters, kernel_size) in enumerate(zip(num_filters, kernel_sizes)):
+            layers.extend([
+                nn.Conv1d(in_channels, filters, kernel_size, padding=kernel_size//2),
+                nn.BatchNorm1d(filters),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ])
+            if i < len(num_filters) - 1:  # Add pooling except for last layer
+                layers.append(nn.MaxPool1d(2, stride=2))
+            in_channels = filters
+        
+        self.conv_layers = nn.Sequential(*layers)
+        
+        # FIXED: Calculate the size after convolutions with correct sample input
+        with torch.no_grad():
+            # Create sample input in the same format as forward() expects
+            if self.reshape_needed:
+                sample_input = torch.randn(1, self.input_size, 1)
+            else:
+                # Match the actual input format: (batch, sequence_length, input_size)
+                sample_input = torch.randn(1, self.sequence_length, self.input_size)
+                # Then transpose to Conv1d format: (batch, input_size, sequence_length)
+                sample_input = sample_input.transpose(1, 2)
+            
+            conv_output = self.conv_layers(sample_input)
+            conv_output_size = conv_output.shape[1] * conv_output.shape[2]
+        
+        # Final projection layers
+        self.projection = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(conv_output_size, output_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(output_dim * 2, output_dim)
+        )
+        
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through CNN.
+        
+        Args:
+            observations: Input tensor of shape (batch_size, *obs_shape)
+            
+        Returns:
+            Features tensor of shape (batch_size, output_dim)
+        """
+        batch_size = observations.shape[0]
+        
+        # Reshape observations if needed
+        if self.reshape_needed:
+            # For 1D obs, create a sequence of length 1
+            observations = observations.view(batch_size, self.input_size, 1)
+        elif observations.dim() == 3:  # ← FIXED: Check for 3D tensor
+            # Input: (batch_size, sequence_length, input_size) = (1, 20, 290)
+            # Conv1d expects: (batch_size, input_size, sequence_length) = (1, 290, 20)
+            observations = observations.transpose(1, 2)  # Swap dimensions 1 and 2
+        elif observations.dim() == 2:
+            # FIXED: Correct reshaping for Conv1d
+            # Input: (batch_size, sequence_length, input_size) = (1, 20, 290)
+            # Conv1d expects: (batch_size, input_size, sequence_length) = (1, 290, 20)
+            observations = observations.transpose(1, 2)  # Swap dimensions 1 and 2
+        
+        # Apply convolutions
+        x = self.conv_layers(observations)
+        
+        # Project to final feature dimension
+        features = self.projection(x)
+        
+        return features
+
+
+class CustomCNNLSTM(BaseFeaturesExtractor):
+    def __init__(self, observation_space: gym.spaces.Box, output_dim=128,
+                 cnn_filters=[32, 64], cnn_kernel_sizes=[3, 3], cnn_dropout=0.1,
+                 lstm_hidden_size=64, lstm_num_layers=1, lstm_dropout=0.0):
+        """
+        CNN-LSTM hybrid feature extractor combining local pattern detection with sequence memory.
+        
+        Args:
+            observation_space: The observation space
+            output_dim: Final output feature dimension
+            cnn_filters: Number of filters for each CNN layer
+            cnn_kernel_sizes: Kernel sizes for each CNN layer
+            cnn_dropout: Dropout rate for CNN layers
+            lstm_hidden_size: Hidden size of LSTM layer
+            lstm_num_layers: Number of LSTM layers
+            lstm_dropout: Dropout rate for LSTM layers
+        """
+        super().__init__(observation_space, features_dim=output_dim)
+        
+        self.output_dim = output_dim
+        self.lstm_hidden_size = lstm_hidden_size
+        self.lstm_num_layers = lstm_num_layers
+        
+        # Handle different observation space shapes
+        obs_shape = observation_space.shape
+        if len(obs_shape) == 1:
+            # Flat observation space - treat as single timestep
+            self.input_size = obs_shape[0]
+            self.sequence_length = 1
+            self.reshape_needed = True
+        elif len(obs_shape) == 2:
+            # 2D observation space (sequence_length, input_size)
+            self.sequence_length = obs_shape[0]
+            self.input_size = obs_shape[1]
+            self.reshape_needed = False
+        else:
+            raise ValueError(f"Unsupported observation space shape: {obs_shape}")
+        
+        # Build CNN layers for local pattern detection
+        cnn_layers = []
+        in_channels = self.input_size
+        
+        for i, (filters, kernel_size) in enumerate(zip(cnn_filters, cnn_kernel_sizes)):
+            cnn_layers.extend([
+                nn.Conv1d(in_channels, filters, kernel_size, padding=kernel_size//2),
+                nn.BatchNorm1d(filters),
+                nn.ReLU(),
+                nn.Dropout(cnn_dropout)
+            ])
+            # No pooling - we want to preserve sequence length for LSTM
+            in_channels = filters
+        
+        self.cnn_layers = nn.Sequential(*cnn_layers)
+        
+        # The CNN output will have shape (batch_size, final_filters, sequence_length)
+        # We need to transpose it to (batch_size, sequence_length, final_filters) for LSTM
+        cnn_output_features = cnn_filters[-1] if cnn_filters else self.input_size
+        
+        # LSTM layers for temporal modeling
+        self.lstm = nn.LSTM(
+            input_size=cnn_output_features,
+            hidden_size=lstm_hidden_size,
+            num_layers=lstm_num_layers,
+            dropout=lstm_dropout if lstm_num_layers > 1 else 0.0,
+            batch_first=True
+        )
+        
+        # Final projection to desired output dimension
+        self.final_projection = nn.Sequential(
+            nn.Linear(lstm_hidden_size, output_dim),
+            nn.ReLU(),
+            nn.Dropout(cnn_dropout)
+        )
+        
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through CNN-LSTM hybrid.
+        
+        Args:
+            observations: Input tensor of shape (batch_size, *obs_shape)
+            
+        Returns:
+            Features tensor of shape (batch_size, output_dim)
+        """
+        batch_size = observations.shape[0]
+        
+        # FIXED: Handle all observation shapes correctly
+        if self.reshape_needed:
+            # For 1D obs, create a sequence of length 1
+            observations = observations.view(batch_size, self.input_size, 1)
+        elif observations.dim() == 3:  # ← FIXED: Check for 3D tensor first
+            # Input: (batch_size, sequence_length, input_size) = (1, 20, 290)
+            # Conv1d expects: (batch_size, input_size, sequence_length) = (1, 290, 20)
+            observations = observations.transpose(1, 2)
+        elif observations.dim() == 2:
+            # This would be for already flattened observations
+            observations = observations.view(batch_size, self.sequence_length, self.input_size)
+            observations = observations.transpose(1, 2)
+        else:
+            raise ValueError(f"Unsupported observation shape: {observations.shape}")
+        
+        # Apply CNN layers for local pattern detection
+        cnn_features = self.cnn_layers(observations)  # (batch_size, cnn_output_features, sequence_length)
+        
+        # Transpose for LSTM: (batch_size, sequence_length, cnn_output_features)
+        cnn_features = cnn_features.transpose(1, 2)
+        
+        # Initialize LSTM hidden states
+        h_0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size,
+                         device=observations.device, dtype=observations.dtype)
+        c_0 = torch.zeros(self.lstm_num_layers, batch_size, self.lstm_hidden_size,
+                         device=observations.device, dtype=observations.dtype)
+        
+        # Apply LSTM layers for temporal modeling
+        lstm_out, (h_n, c_n) = self.lstm(cnn_features, (h_0, c_0))
+        
+        # Take the last timestep output
+        last_output = lstm_out[:, -1, :]  # (batch_size, lstm_hidden_size)
+        
+        # Final projection to output dimension
+        features = self.final_projection(last_output)
+        
+        return features
+
+
+class CustomTransformerPolicy(ActorCriticPolicy):
+    def __init__(self, observation_space, action_space, lr_schedule,
+                 net_arch=None, activation_fn=nn.Tanh, embed_dim=128, num_heads=8,
+                 num_layers=2, dropout=0.1, **kwargs):
+        """
+        Custom ActorCritic policy using Transformer feature extractor.
+        """
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.dropout = dropout
+        
+        # Prepare feature extractor kwargs
+        features_extractor_kwargs = {
+            'embed_dim': embed_dim,
+            'num_heads': num_heads,
+            'num_layers': num_layers,
+            'dropout': dropout
+        }
+        
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            features_extractor_class=CustomTransformer,
+            features_extractor_kwargs=features_extractor_kwargs,
+            net_arch=net_arch,
+            activation_fn=activation_fn,
+            **kwargs
+        )
+
+
+class CustomCNNPolicy(ActorCriticPolicy):
+    def __init__(self, observation_space, action_space, lr_schedule,
+                 net_arch=None, activation_fn=nn.Tanh, output_dim=128,
+                 num_filters=[32, 64, 128], kernel_sizes=[3, 3, 3], dropout=0.1, **kwargs):
+        """
+        Custom ActorCritic policy using CNN feature extractor.
+        """
+        self.output_dim = output_dim
+        self.num_filters = num_filters
+        self.kernel_sizes = kernel_sizes
+        self.dropout = dropout
+        
+        # Prepare feature extractor kwargs
+        features_extractor_kwargs = {
+            'output_dim': output_dim,
+            'num_filters': num_filters,
+            'kernel_sizes': kernel_sizes,
+            'dropout': dropout
+        }
+        
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            features_extractor_class=CustomCNN,
+            features_extractor_kwargs=features_extractor_kwargs,
+            net_arch=net_arch,
+            activation_fn=activation_fn,
+            **kwargs
+        )
+
+
+class CustomCNNLSTMPolicy(ActorCriticPolicy):
+    def __init__(self, observation_space, action_space, lr_schedule,
+                 net_arch=None, activation_fn=nn.Tanh, output_dim=128,
+                 cnn_filters=[32, 64], cnn_kernel_sizes=[3, 3], cnn_dropout=0.1,
+                 lstm_hidden_size=64, lstm_num_layers=1, lstm_dropout=0.0, **kwargs):
+        """
+        Custom ActorCritic policy using CNN-LSTM hybrid feature extractor.
+        
+        Args:
+            observation_space: The observation space
+            action_space: The action space
+            lr_schedule: Learning rate schedule
+            net_arch: Network architecture for actor/critic networks after feature extraction
+            activation_fn: Activation function for the networks
+            output_dim: Final output feature dimension
+            cnn_filters: Number of filters for each CNN layer
+            cnn_kernel_sizes: Kernel sizes for each CNN layer
+            cnn_dropout: Dropout rate for CNN layers
+            lstm_hidden_size: Hidden size of LSTM layer
+            lstm_num_layers: Number of LSTM layers
+            lstm_dropout: Dropout rate for LSTM layers
+            **kwargs: Additional arguments passed to parent class
+        """
+        self.output_dim = output_dim
+        self.cnn_filters = cnn_filters
+        self.cnn_kernel_sizes = cnn_kernel_sizes
+        self.cnn_dropout = cnn_dropout
+        self.lstm_hidden_size = lstm_hidden_size
+        self.lstm_num_layers = lstm_num_layers
+        self.lstm_dropout = lstm_dropout
+        
+        # Prepare feature extractor kwargs
+        features_extractor_kwargs = {
+            'output_dim': output_dim,
+            'cnn_filters': cnn_filters,
+            'cnn_kernel_sizes': cnn_kernel_sizes,
+            'cnn_dropout': cnn_dropout,
+            'lstm_hidden_size': lstm_hidden_size,
+            'lstm_num_layers': lstm_num_layers,
+            'lstm_dropout': lstm_dropout
+        }
+        
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            features_extractor_class=CustomCNNLSTM,
+            features_extractor_kwargs=features_extractor_kwargs,
+            net_arch=net_arch,
+            activation_fn=activation_fn,
+            **kwargs
+        )
+
+
+class CustomLSTMPolicy(ActorCriticPolicy):
+    def __init__(self, observation_space, action_space, lr_schedule,
+                 net_arch=None, activation_fn=nn.Tanh, lstm_hidden_size=64, 
+                 lstm_num_layers=1, lstm_dropout=0.0, **kwargs):
+        """
+        Custom ActorCritic policy using LSTM feature extractor.
+        
+        Args:
+            observation_space: The observation space
+            action_space: The action space  
+            lr_schedule: Learning rate schedule
+            net_arch: Network architecture for actor/critic networks after feature extraction
+            activation_fn: Activation function for the networks
+            lstm_hidden_size: Hidden size of LSTM feature extractor
+            lstm_num_layers: Number of LSTM layers
+            lstm_dropout: LSTM dropout rate
+            **kwargs: Additional arguments passed to parent class
+        """
+        self.lstm_hidden_size = lstm_hidden_size
+        self.lstm_num_layers = lstm_num_layers
+        self.lstm_dropout = lstm_dropout
+        
+        # Prepare feature extractor kwargs
+        features_extractor_kwargs = {
+            'lstm_hidden_size': lstm_hidden_size,
+            'num_layers': lstm_num_layers,
+            'dropout': lstm_dropout
+        }
+        
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            features_extractor_class=CustomLSTM,
+            features_extractor_kwargs=features_extractor_kwargs,
+            net_arch=net_arch,
+            activation_fn=activation_fn,
+            **kwargs
+        )
 
 
 class DRLAgent:
