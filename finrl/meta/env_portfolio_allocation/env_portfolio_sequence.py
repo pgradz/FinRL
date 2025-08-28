@@ -41,7 +41,12 @@ class StockPortfolioSequenceEnv(gym.Env):
         sequence_length=20,  # NEW: Length of historical sequence
         flatten_observations=False,  # NEW: Whether to flatten for MLP models
         include_returns=False,  # NEW: Include historical returns in observations
-        include_volume=False,  # NEW: Include volume data
+        include_volume=False,  # NEW: Include volume data,
+        model_name="",
+        mode="",
+        iteration="",
+        seed=""
+
     ):
         """
         Initialize the sequence-aware portfolio environment.
@@ -70,6 +75,12 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.flatten_observations = flatten_observations
         self.include_returns = include_returns
         self.include_volume = include_volume
+
+        # for muliple runs
+        self.model_name = model_name
+        self.mode = mode
+        self.iteration = iteration
+        self.seed = seed
         
         # Calculate state dimensions (1D like stock trading env)
         # State: [portfolio_value, prices, weights, tech_indicators, returns?, volume?]
@@ -255,11 +266,32 @@ class StockPortfolioSequenceEnv(gym.Env):
                 print("Sharpe: ", sharpe)
             print("=================================")
 
+            if (self.model_name != "") and (self.mode != ""):
+                df_actions = self.save_action_memory()
+                df_actions.to_csv(
+                    "results/actions_{}_{}_{}_{}.csv".format(
+                        self.mode, self.model_name, self.iteration, self.seed
+                    )
+                )
+
+                df_total_value = pd.DataFrame(self.asset_memory)
+                df_total_value.columns = ["account_value"]
+                df_total_value["date"] = self.date_memory
+                df_total_value["daily_return"] = df_total_value["account_value"].pct_change(1)
+                df_total_value.to_csv(
+                    "results/account_value_{}_{}_{}_{}.csv".format(
+                        self.mode, self.model_name, self.iteration, self.seed
+                    ),
+                    index=False,
+                )
+
             return self._get_observation(), self.reward, self.terminal, False, {}
 
         else:
             # Normalize actions to portfolio weights
-            weights = self.softmax_normalization(actions)
+            # weights = self.softmax_normalization(actions) - library solution
+            total_weight = np.sum(actions)
+            weights = actions / total_weight
             self.current_weights = weights  # Update current weights
             self.actions_memory.append(weights)
             last_day_memory = self.data
@@ -275,6 +307,7 @@ class StockPortfolioSequenceEnv(gym.Env):
             
             # Update portfolio value
             new_portfolio_value = self.portfolio_value * (1 + portfolio_return)
+            gain = new_portfolio_value - self.portfolio_value
             self.portfolio_value = new_portfolio_value
 
             # NEW: Update observation buffer with new state
@@ -287,8 +320,8 @@ class StockPortfolioSequenceEnv(gym.Env):
             self.date_memory.append(self.data.date.unique()[0])
             self.asset_memory.append(new_portfolio_value)
 
-            # Reward is the new portfolio value
-            self.reward = new_portfolio_value
+            # Reward is the gain
+            self.reward = gain
 
         return self._get_observation(), self.reward, self.terminal, False, {}
 

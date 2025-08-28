@@ -886,6 +886,8 @@ class DRLAgent:
         train_df: pd.DataFrame,
         val_df: pd.DataFrame,
         param_grid: list[dict],
+        policy="MlpPolicy",  # Direct policy parameter with default
+        policy_kwargs_grid: list[dict] = None,  # Optional policy kwargs grid
         total_timesteps=50_000,
         env_constructor=None,
         eval_freq=10_000,
@@ -893,43 +895,47 @@ class DRLAgent:
         **env_kwargs
     ):
         """
-        Conduct hyperparameter search:
-      - For each hyperparam dictionary in param_grid:
-        1) Train on train_df with `eval_env=val_env` so that
-           EvalCallback can save the best checkpoint by mean reward.
-        2) After training, load that 'best checkpoint' from disk.
-        3) Compute Sharpe ratio on val_df.
-      - Keep whichever param set yields the highest Sharpe ratio on val_df.
-
+        Conduct hyperparameter search including both model and policy parameters.
+        
         Parameters
         ----------
         model_name : str
-            One of {"ppo", "a2c", "ddpg", "td3", "sac"} in your code.
+            One of {"ppo", "a2c", "ddpg", "td3", "sac"}.
         train_df : pd.DataFrame
             In-sample training data.
         val_df : pd.DataFrame
             Validation data used for hyperparam selection.
         param_grid : list of dict
-            Each dict is a hyperparam combination to try (e.g., {"learning_rate": 1e-4, "n_steps": 2048}).
-        total_timesteps : int
-            Number of timesteps to train each candidate.
-        env_constructor : callable
-            A function/lambda that builds your StockTradingEnv given df & env_kwargs.
-        eval_freq : int
-            Frequency (in timesteps) at which EvalCallback runs & checks for best reward.
-        best_model_base_path : str
-            Folder where we store the best model checkpoint for each param set.
-        env_kwargs : dict
-            Additional args to pass into env_constructor (like initial_amount, etc.).
-         """
+            Each dict is a model hyperparam combination to try.
+        policy : str or class, default="MlpPolicy"
+            Policy type to use (e.g., "MlpPolicy", CustomLSTMPolicy, etc.).
+        policy_kwargs_grid : list of dict, optional
+            Each dict contains policy-specific parameters to try.
+            If None, uses empty dict (no policy kwargs).
+            Example: [
+                {"lstm_hidden_size": 64, "lstm_num_layers": 1},
+                {"lstm_hidden_size": 128, "lstm_num_layers": 2}
+            ]
+        """
+
 
         best_sharpe = -999
         best_params = None
         best_model = None
 
+        # Default policy kwargs if none provided
+        if policy_kwargs_grid is None:
+            policy_kwargs_grid = [{}]  # Single empty dict for no policy kwargs
+
+        # Check if we're doing policy search (affects return format)
+        doing_policy_search = len(policy_kwargs_grid) > 1 or (
+            len(policy_kwargs_grid) == 1 and policy_kwargs_grid[0] != {}
+        )
+
         # If no env_constructor was provided, default to the static method:
         if env_constructor is None:
             env_constructor = DRLAgent.env_constructor
+            
         # Build the training env
         train_env_gym = env_constructor(train_df, **env_kwargs)
         env_train, _ = train_env_gym.get_sb_env()
@@ -938,22 +944,38 @@ class DRLAgent:
         val_env_gym = env_constructor(val_df, **env_kwargs)
         env_val, _ = val_env_gym.get_sb_env()
 
-        for i, param_dict in enumerate(param_grid, start=1):
-            print(f"Testing param set {i}/{len(param_grid)}: {param_dict}")
+        # Create all combinations of model params and policy kwargs
+        total_combinations = len(param_grid) * len(policy_kwargs_grid)
+        combination_idx = 0
 
-            # Create model
-            self.env = env_train
-            model = self.get_model(model_name, model_kwargs=param_dict, verbose=0)
+        for model_params in param_grid:
+            for policy_kwargs in policy_kwargs_grid:
+                combination_idx += 1
+                
+                print(f"Testing combination {combination_idx}/{total_combinations}")
+                print(f"Model params: {model_params}")
+                print(f"Policy: {policy}")
+                print(f"Policy kwargs: {policy_kwargs}")
 
-            # Train
-            model = self.train_model(
-                model,
-                tb_log_name=f"{model_name}_search_{i}",
-                total_timesteps=total_timesteps,
-                eval_env=env_val,  
-                eval_freq=eval_freq,
-                best_model_save_path=best_model_save_path,
-                model_name=model_name,  # ensures a subfolder for each model
+                # Create model
+                self.env = env_train
+                model = self.get_model(
+                    model_name, 
+                    policy=policy,
+                    policy_kwargs=policy_kwargs if policy_kwargs else None,
+                    model_kwargs=model_params, 
+                    verbose=0
+                )
+
+                # Train
+                model = self.train_model(
+                    model,
+                    tb_log_name=f"{model_name}_search_{combination_idx}",
+                    total_timesteps=total_timesteps,
+                    eval_env=env_val,  
+                    eval_freq=eval_freq,
+                    best_model_save_path=best_model_save_path,
+                    model_name=model_name,
             )
 
             # 4) Load the best checkpoint from the callback (best_model.zip)
@@ -988,7 +1010,7 @@ class DRLAgent:
             # so we produce e.g. account_value_validation_final_{model_name}_{i}.csv
             val_env_final = env_constructor(
                 val_df,
-                iteration=i,
+                iteration=combination_idx,
                 model_name=f"{model_name}_final",  # or some suffix
                 mode="validation",
                 **env_kwargs
@@ -997,32 +1019,32 @@ class DRLAgent:
             # short rollout
             self._run_env_to_end(model, val_env_final_vec)
             # now environment writes: "account_value_validation_{model_name}_final_{i}.csv"
-            file_final = f"results/account_value_validation_{model_name}_final_{i}.csv"
+            file_final = f"results/account_value_validation_{model_name}_final_{combination_idx}_.csv"
             if not os.path.exists(file_final):
                 print("Warning: final model CSV not found, perhaps environment didn't terminate?")
                 final_sharpe = -999
             else:
                 final_sharpe = self.get_validation_sharpe_custom(file_final)
-            print(f"Final model Sharpe for param {i}: {final_sharpe:.4f}")
+            print(f"Final model Sharpe for param {combination_idx}: {final_sharpe:.4f}")
 
             # --(B) Build validation environment for the checkpoint
             # so we produce e.g. account_value_validation_ckpt_{model_name}_{i}.csv
             val_env_ckpt = env_constructor(
                 val_df,
-                iteration=i,
+                iteration=combination_idx,
                 model_name=f"{model_name}_ckpt",  # or some suffix
                 mode="validation",
                 **env_kwargs
             )
             val_env_ckpt_vec = DummyVecEnv([lambda: val_env_ckpt])
             self._run_env_to_end(best_model_checkpoint, val_env_ckpt_vec)
-            file_ckpt = f"results/account_value_validation_{model_name}_ckpt_{i}.csv"
+            file_ckpt = f"results/account_value_validation_{model_name}_ckpt_{combination_idx}_.csv"
             if not os.path.exists(file_ckpt):
                 print("Warning: checkpoint model CSV not found.")
                 ckpt_sharpe = -999
             else:
                 ckpt_sharpe = self.get_validation_sharpe_custom(file_ckpt)
-            print(f"Checkpoint model Sharpe for param {i}: {ckpt_sharpe:.4f}")
+            print(f"Checkpoint model Sharpe for param {combination_idx}: {ckpt_sharpe:.4f}")
                 
             # 5) Decide which is better for this param set
             if ckpt_sharpe >= final_sharpe:
@@ -1035,8 +1057,18 @@ class DRLAgent:
             # 6) Compare across all param sets
             if param_best_sharpe > best_sharpe:
                 best_sharpe = param_best_sharpe
-                best_params = param_dict
                 best_model  = param_best_model
+                # BACKWARD COMPATIBLE: Choose return format based on usage
+                if doing_policy_search:
+                    # Return nested structure when doing policy search
+                    best_params = {
+                        "model_params": model_params,
+                        "policy": policy,
+                        "policy_kwargs": policy_kwargs
+                    }
+                else:
+                    # Return direct model params for backward compatibility
+                    best_params = model_params
 
         print("===== Hyperparam Search Finished =====")
         print(f"Best Sharpe: {best_sharpe:.4f}")
