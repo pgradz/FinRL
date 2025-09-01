@@ -1141,8 +1141,20 @@ class DRLAgent:
 
         if not isinstance(seed, int):
             seed = 0
-
         
+        # check structure of params_fixed if it contains model_params, policy and policy kwargs or only model_params
+        if "model_params" in fixed_params:
+            model_params = fixed_params["model_params"]
+        else:
+            model_params = fixed_params
+
+        if "policy" in fixed_params:
+            policy = fixed_params["policy"]
+            policy_kwargs = fixed_params.get("policy_kwargs", {})
+        else:
+            policy = "MlpPolicy"
+            policy_kwargs = {}
+
         start_date = pd.to_datetime(start_date)
         end_date   = pd.to_datetime(end_date)
 
@@ -1183,7 +1195,11 @@ class DRLAgent:
 
             train_end_date = sorted_dates[current_idx]
             val_start_date = sorted_dates[current_idx]
-            val_end_date_ = sorted_dates[val_end_idx]  # inclusive
+            if val_end_idx >= len(sorted_dates):
+                val_end_date_ = sorted_dates[-1]  # Last available date
+                print(f"Warning: val_end_idx ({val_end_idx}) >= array size ({len(sorted_dates)}). Using last date.")
+            else:
+                val_end_date_ = sorted_dates[val_end_idx]  # Keep original indexing logic
 
             print("========================================")
             print(f"Iteration {iteration_no}")
@@ -1208,7 +1224,7 @@ class DRLAgent:
 
             # 3) Create model & setup callback
             self.env = env_train
-            model = self.get_model(model_name, model_kwargs=fixed_params, verbose=0, seed=seed)
+            model = self.get_model(model_name, model_kwargs=model_params, policy=policy, policy_kwargs=policy_kwargs, verbose=0, seed=seed)
 
             # Use existing train_model to avoid repeating code:
             iteration_save_dir = os.path.join(best_model_prefix, f"{model_name}_iter_{iteration_no}")
@@ -1305,7 +1321,15 @@ class DRLAgent:
                 break
 
             trade_start_date_ = sorted_dates[trade_start_idx]
-            trade_end_date_ = sorted_dates[trade_end_idx] if trade_end_idx > trade_start_idx else trade_start_date_
+            if trade_end_idx >= len(sorted_dates):
+                trade_end_date_ = sorted_dates[-1]  # Use last available date
+                print(f"Warning: trade_end_idx ({trade_end_idx}) >= array size ({len(sorted_dates)}). Using last date: {trade_end_date_}")
+            elif trade_end_idx > trade_start_idx:
+                trade_end_date_ = sorted_dates[trade_end_idx - 1]  # Use inclusive end date
+            else:
+                trade_end_date_ = trade_start_date_
+                print(f"Warning: No trading period available. trade_start_idx={trade_start_idx}, trade_end_idx={trade_end_idx}")
+        
             print(f"Trading from {trade_start_date_} to {trade_end_date_}")
 
             trade_df = data_split(df, start=trade_start_date_, end=trade_end_date_)

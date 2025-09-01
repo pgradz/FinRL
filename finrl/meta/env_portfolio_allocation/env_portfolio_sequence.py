@@ -38,6 +38,8 @@ class StockPortfolioSequenceEnv(gym.Env):
         turbulence_threshold=None,
         lookback=252,
         day=0,
+        initial = True,
+        previous_state = [],
         sequence_length=20,  # NEW: Length of historical sequence
         flatten_observations=False,  # NEW: Whether to flatten for MLP models
         include_returns=False,  # NEW: Include historical returns in observations
@@ -69,6 +71,9 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.transaction_cost_pct = transaction_cost_pct
         self.reward_scaling = reward_scaling
         self.tech_indicator_list = tech_indicator_list
+
+        self.initial = initial
+        self.previous_state = previous_state
         
         # NEW: Sequence parameters
         self.sequence_length = sequence_length
@@ -89,10 +94,10 @@ class StockPortfolioSequenceEnv(gym.Env):
             base_features_per_stock += 1
         if self.include_volume:
             base_features_per_stock += 1
-            
-        # Total state dimension: portfolio_value + prices + weights + tech_features * stocks
-        self.state_dim = self.stock_dim + self.stock_dim + (base_features_per_stock * self.stock_dim)
-            
+
+        # Total state dimension:  prices + weights + tech_features * stocks + portfolio_value
+        self.state_dim = self.stock_dim + self.stock_dim + (base_features_per_stock * self.stock_dim) + 1
+
         # Action space: portfolio weights (softmax normalized)
         self.action_space = spaces.Box(low=0, high=1, shape=(action_space,))
         
@@ -116,11 +121,19 @@ class StockPortfolioSequenceEnv(gym.Env):
         # Initialize environment
         self.terminal = False
         self.turbulence_threshold = turbulence_threshold
+        
+        # Initialize portfolio weights to equal weight
+        if self.initial:
+            self.current_weights = np.array([1.0 / self.stock_dim] * self.stock_dim)
+        else: 
+        # extract weights from the last step (sequence length) of the previous state, 
+        # state is an array [sequence length, list of stock prices for len(daily_data.tic.unique()) 
+        # followed by weights for len(daily_data.tic.unique()) stocks and then followed by some indicators]
+            self.current_weights = np.array(self.previous_state[-1][self.stock_dim:2*self.stock_dim])
+            self.initial_amount = self.previous_state[-1][-1]
+
         self.portfolio_value = self.initial_amount
-        
-        # Initialize portfolio weights (equal weight)
-        self.current_weights = np.array([1.0 / self.stock_dim] * self.stock_dim)
-        
+
         # Memory containers
         self.asset_memory = [self.initial_amount]
         self.portfolio_return_memory = [0]
@@ -182,8 +195,11 @@ class StockPortfolioSequenceEnv(gym.Env):
                 state.extend(daily_data[tech].values.tolist())
             else:
                 state.append(daily_data[tech].iloc[0])
-        
-        # 4. Returns (if enabled) - market performance
+
+        # 4. current portfolio worth
+        state.append(self.portfolio_value)
+
+        # 5. Returns (if enabled) - market performance
         if self.include_returns:
             if day_idx > 0:
                 prev_data = self.df.loc[day_idx - 1, :]
@@ -199,8 +215,8 @@ class StockPortfolioSequenceEnv(gym.Env):
                     state.extend([0.0] * self.stock_dim)
                 else:
                     state.append(0.0)
-        
-        # 5. Volume (if enabled and available) - market liquidity
+
+        # 6. Volume (if enabled and available) - market liquidity
         if self.include_volume:
             if 'volume' in daily_data.columns:
                 if len(daily_data.tic.unique()) > 1:
@@ -218,6 +234,9 @@ class StockPortfolioSequenceEnv(gym.Env):
                     state.extend([0.0] * self.stock_dim)
                 else:
                     state.append(0.0)
+
+        if len(state) != self.state_dim:
+            print(f"ERROR: State dimension mismatch!")
         
         return np.array(state)
     
@@ -321,6 +340,7 @@ class StockPortfolioSequenceEnv(gym.Env):
             self.asset_memory.append(new_portfolio_value)
 
             # Reward is the gain
+             # self.reward = gain * self.reward_scaling # this produced inferior results - needs to be investigated
             self.reward = gain
 
         return self._get_observation(), self.reward, self.terminal, False, {}
@@ -332,9 +352,12 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.portfolio_value = self.initial_amount
         self.terminal = False
         self.portfolio_return_memory = [0]
-        
-        # Reset portfolio weights to equal weight
-        self.current_weights = np.array([1.0 / self.stock_dim] * self.stock_dim)
+
+        if self.initial:
+            self.current_weights = np.array([1.0 / self.stock_dim] * self.stock_dim)
+        else: 
+            self.current_weights = np.array(self.previous_state[-1][self.stock_dim:2*self.stock_dim])
+
         self.actions_memory = [self.current_weights.tolist()]
         
         self.date_memory = []
@@ -361,7 +384,7 @@ class StockPortfolioSequenceEnv(gym.Env):
         date_list = self.date_memory
         portfolio_return = self.portfolio_return_memory
         df_account_value = pd.DataFrame(
-            {"date": date_list, "daily_return": portfolio_return}
+            {"date": date_list, "daily_return": portfolio_return, "account_value": self.asset_memory}
         )
         return df_account_value
 
