@@ -28,6 +28,7 @@ class StockPortfolioSequenceEnv(gym.Env):
     def __init__(
         self,
         df,
+        macro_df,
         stock_dim,
         hmax,
         initial_amount,
@@ -44,6 +45,8 @@ class StockPortfolioSequenceEnv(gym.Env):
         flatten_observations=False,  # NEW: Whether to flatten for MLP models
         include_returns=False,  # NEW: Include historical returns in observations
         include_volume=False,  # NEW: Include volume data,
+        dsr_eta: float = 0.1, # NEW: Update rate for Differential Sharpe Ratio
+        reward_type: str = "pnl",  # NEW: Reward function type: 'pnl' or 'sharpe' or dsr
         model_name="",
         mode="",
         iteration="",
@@ -65,6 +68,7 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.day = day
         self.lookback = lookback
         self.df = df
+        self.macro_df = macro_df
         self.stock_dim = stock_dim
         self.hmax = hmax
         self.initial_amount = initial_amount
@@ -80,6 +84,8 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.flatten_observations = flatten_observations
         self.include_returns = include_returns
         self.include_volume = include_volume
+        self.reward_type = reward_type
+        self.dsr_eta = dsr_eta
 
         # for muliple runs
         self.model_name = model_name
@@ -95,8 +101,15 @@ class StockPortfolioSequenceEnv(gym.Env):
         if self.include_volume:
             base_features_per_stock += 1
 
-        # Total state dimension:  prices + weights + tech_features * stocks + portfolio_value
-        self.state_dim = self.stock_dim + self.stock_dim + (base_features_per_stock * self.stock_dim) + 1
+        # Macro features
+        if self.macro_df is not None:
+            macro_features = self.macro_df.shape[1] - 1 # subtract date column
+            self.validate_macro_alignment()
+        else:
+            macro_features = 0
+
+        # Total state dimension:  prices + weights + tech_features * stocks + portfolio_value + macro_features
+        self.state_dim = self.stock_dim + self.stock_dim + (base_features_per_stock * self.stock_dim) + 1 + macro_features
 
         # Action space: portfolio weights (softmax normalized)
         self.action_space = spaces.Box(low=0, high=1, shape=(action_space,))
@@ -145,6 +158,11 @@ class StockPortfolioSequenceEnv(gym.Env):
         
         # Initialize with first observation
         self._initialize_observation_buffer()
+
+        # NEW: Initialize state for Differential Sharpe Ratio
+        self.dsr_a = 0.0
+        self.dsr_b = 0.0
+        self.last_sharpe = 0.0
 
     def _initialize_observation_buffer(self):
         """Initialize the observation buffer with historical data."""
@@ -196,10 +214,7 @@ class StockPortfolioSequenceEnv(gym.Env):
             else:
                 state.append(daily_data[tech].iloc[0])
 
-        # 4. current portfolio worth
-        state.append(self.portfolio_value)
-
-        # 5. Returns (if enabled) - market performance
+        # 4. Returns (if enabled) - market performance
         if self.include_returns:
             if day_idx > 0:
                 prev_data = self.df.loc[day_idx - 1, :]
@@ -216,7 +231,7 @@ class StockPortfolioSequenceEnv(gym.Env):
                 else:
                     state.append(0.0)
 
-        # 6. Volume (if enabled and available) - market liquidity
+        # 5. Volume (if enabled and available) - market liquidity
         if self.include_volume:
             if 'volume' in daily_data.columns:
                 if len(daily_data.tic.unique()) > 1:
@@ -234,6 +249,37 @@ class StockPortfolioSequenceEnv(gym.Env):
                     state.extend([0.0] * self.stock_dim)
                 else:
                     state.append(0.0)
+
+        # 6. Macro features (if available) - economic context
+        if self.macro_df is not None:
+            # Get the actual date from the current daily_data
+            if len(daily_data.tic.unique()) > 1:
+                current_date = daily_data.date.unique()[0]
+            else:
+                current_date = daily_data.date.iloc[0]
+            
+            # Find matching row in macro_df by date
+            macro_row = self.macro_df[self.macro_df['date'] == current_date]
+            
+            if len(macro_row) > 0:
+                # Found exact date match
+                macro_features = macro_row.iloc[0, 1:].values.flatten()  # skip date column
+                state.extend(macro_features.tolist())
+            else:
+                # Fallback: find the most recent macro data before or on current_date
+                available_macro_dates = self.macro_df[self.macro_df['date'] <= current_date]
+                if len(available_macro_dates) > 0:
+                    # Use the most recent available macro data
+                    latest_macro_row = available_macro_dates.iloc[-1]
+                    macro_features = latest_macro_row.iloc[1:].values.flatten()  # skip date column
+                    state.extend(macro_features.tolist())
+                else:
+                    # No historical macro data available - use zeros
+                    macro_feature_count = self.macro_df.shape[1] - 1  # subtract date column
+                    state.extend([0.0] * macro_feature_count)
+
+        # 7. current portfolio worth - has to be on the last place
+        state.append(self.portfolio_value)
 
         if len(state) != self.state_dim:
             print(f"ERROR: State dimension mismatch!")
@@ -257,6 +303,10 @@ class StockPortfolioSequenceEnv(gym.Env):
     def step(self, actions):
         """Step function with sequence-aware observations."""
         self.terminal = self.day >= len(self.df.index.unique()) - 1
+
+        if np.all(actions == 0):
+            print("Warning: Actions are all zeros, assigning equal weights.")
+            actions = np.array([1.0 / len(actions)] * len(actions))
 
         if self.terminal:
             # Terminal state - save plots and print statistics
@@ -309,6 +359,10 @@ class StockPortfolioSequenceEnv(gym.Env):
         else:
             # Normalize actions to portfolio weights
             # weights = self.softmax_normalization(actions) - library solution
+            # Store current weights before updating (these were active during current day)
+            
+            # Normalize actions to get new portfolio weights
+            
             total_weight = np.sum(actions)
             weights = actions / total_weight
             self.current_weights = weights  # Update current weights
@@ -323,6 +377,9 @@ class StockPortfolioSequenceEnv(gym.Env):
             portfolio_return = sum(
                 ((self.data.close.values / last_day_memory.close.values) - 1) * weights
             )
+
+            assert not np.isnan(portfolio_return), "Portfolio return contains NaN values"
+            assert not np.isinf(portfolio_return), "Portfolio return contains Inf values"
             
             # Update portfolio value
             new_portfolio_value = self.portfolio_value * (1 + portfolio_return)
@@ -340,10 +397,36 @@ class StockPortfolioSequenceEnv(gym.Env):
             self.asset_memory.append(new_portfolio_value)
 
             # Reward is the gain
-             # self.reward = gain * self.reward_scaling # this produced inferior results - needs to be investigated
-            self.reward = gain
+            if self.reward_type == "dsr":
+                if len(self.asset_memory) > 1:
+                    current_return = (self.asset_memory[-1] / self.asset_memory[-2]) - 1
+                    
+                    # Update running moments (exponential moving average)
+                    self.dsr_a = (1 - self.dsr_eta) * self.dsr_a + self.dsr_eta * current_return
+                    self.dsr_b = (1 - self.dsr_eta) * self.dsr_b + self.dsr_eta * (current_return ** 2)
+                    
+                    # Calculate current Sharpe and the differential reward
+                    current_std = (self.dsr_b - self.dsr_a**2)**0.5
+                    if current_std != 0:
+                        current_sharpe = self.dsr_a / current_std
+                        self.reward = current_sharpe - self.last_sharpe
+                        self.last_sharpe = current_sharpe
+                    else:
+                        self.reward = 0.0
+                else:
+                    self.reward = 0.0
+            else:
+                self.reward = gain
+            
+            assert not np.isnan(self.reward), "Reward contains NaN values"
+            assert not np.isinf(self.reward), "Reward contains Inf values"
 
-        return self._get_observation(), self.reward, self.terminal, False, {}
+            # Validate observation
+            observation = self._get_observation()
+            assert not np.any(np.isnan(observation)), "Observation contains NaN values"
+            assert not np.any(np.isinf(observation)), "Observation contains Inf values"
+
+        return observation, self.reward, self.terminal, False, {}
 
     def reset(self, *, seed=None, options=None):
         """Reset environment with sequence buffer initialization."""
@@ -362,6 +445,11 @@ class StockPortfolioSequenceEnv(gym.Env):
         
         self.date_memory = []
         self.observation_buffer = []
+
+        # Reset DSR states
+        self.dsr_a = 0.0
+        self.dsr_b = 0.0
+        self.last_sharpe = 0.0
         
         # Initialize observation buffer
         self._initialize_observation_buffer()
@@ -410,3 +498,36 @@ class StockPortfolioSequenceEnv(gym.Env):
         e = DummyVecEnv([lambda: self])
         obs = e.reset()
         return e, obs
+
+    def validate_macro_alignment(self):
+        """Validate that macro_df has perfect alignment with main df."""
+        if self.macro_df is None:
+            return True
+        
+        # Check date column exists
+        if 'date' not in self.macro_df.columns:
+            raise ValueError("macro_df must have a 'date' column")
+        
+        # Get date ranges and normalize
+        main_dates = set(pd.to_datetime(self.df['date'].unique()).date)
+        macro_dates = set(pd.to_datetime(self.macro_df['date'].unique()).date)
+        
+        # Check for perfect coverage
+        missing_dates = main_dates - macro_dates
+        extra_dates = macro_dates - main_dates
+        
+        coverage = len(main_dates & macro_dates) / len(main_dates)
+        
+        print(f"Date coverage: {coverage:.1%} ({len(main_dates & macro_dates)}/{len(main_dates)} days)")
+        
+        if coverage < 1.0:
+            print(f"❌ CRITICAL: Incomplete macro data coverage!")
+            if missing_dates:
+                print(f"Missing macro dates: {sorted(list(missing_dates))[:10]}{'...' if len(missing_dates) > 10 else ''}")
+            raise ValueError(f"Macro data must cover ALL trading dates. Missing {len(missing_dates)} dates.")
+        
+        if extra_dates:
+            print(f"ℹ️  Info: Macro data has {len(extra_dates)} extra dates (will be ignored)")
+        
+        print("✅ Perfect macro data alignment confirmed")
+        return True

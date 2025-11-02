@@ -21,7 +21,9 @@ from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import MlpExtractor
-from typing import Callable
+from stable_baselines3.td3.policies import TD3Policy
+from stable_baselines3.sac.policies import SACPolicy
+from typing import Callable, Type
 
 from finrl import config
 from finrl.meta.env_stock_trading.env_stocktrading import StockTradingEnv
@@ -29,12 +31,197 @@ from finrl.meta.preprocessor.preprocessors import data_split
 
 MODELS = {"a2c": A2C, "ddpg": DDPG, "td3": TD3, "sac": SAC, "ppo": PPO}
 
+# Policy base classes for each model type
+# Note: DDPG uses TD3Policy as its base class in Stable Baselines3
+POLICY_BASES = {
+    'ppo': ActorCriticPolicy,
+    'a2c': ActorCriticPolicy,
+    'ddpg': TD3Policy,  # DDPG uses TD3Policy as base
+    'td3': TD3Policy,
+    'sac': SACPolicy,
+}
+
 MODEL_KWARGS = {x: config.__dict__[f"{x.upper()}_PARAMS"] for x in MODELS.keys()}
 
 NOISE = {
     "normal": NormalActionNoise,
     "ornstein_uhlenbeck": OrnsteinUhlenbeckActionNoise,
 }
+
+
+# ============================================================================
+# POLICY FACTORY AND REGISTRY PATTERN
+# ============================================================================
+
+def create_custom_policy(
+    model_name: str,
+    features_extractor_class: Type[BaseFeaturesExtractor],
+    policy_name: str = None
+) -> Type:
+    """
+    Factory function to create custom policies for different RL algorithms.
+    
+    Args:
+        model_name: Name of the RL algorithm ('ppo', 'a2c', 'ddpg', 'td3', 'sac')
+        features_extractor_class: Feature extractor class (CustomLSTM, CustomCNN, etc.)
+        policy_name: Optional custom name for the policy class
+        
+    Returns:
+        Custom policy class compatible with the specified algorithm
+        
+    Example:
+        >>> cnn_ppo_policy = create_custom_policy('ppo', CustomCNN)
+        >>> lstm_ddpg_policy = create_custom_policy('ddpg', CustomLSTM)
+    """
+    if model_name not in POLICY_BASES:
+        raise ValueError(f"Model '{model_name}' not supported. Choose from {list(POLICY_BASES.keys())}")
+    
+    base_policy = POLICY_BASES[model_name]
+    
+    # Generate policy name if not provided
+    if policy_name is None:
+        extractor_name = features_extractor_class.__name__.replace('Custom', '')
+        policy_name = f'Custom{extractor_name}{model_name.upper()}Policy'
+    
+    # Dynamically create policy class
+    class CustomPolicy(base_policy):
+        def __init__(self, observation_space, action_space, lr_schedule,
+                     net_arch=None, activation_fn=nn.Tanh, 
+                     features_extractor_kwargs=None, **kwargs):
+            """
+            Custom policy that can work with any RL algorithm.
+            
+            Extracts features_extractor_kwargs and passes them to the feature extractor.
+            """
+            if features_extractor_kwargs is None:
+                features_extractor_kwargs = {}
+            
+            # For all policy types, pass the feature extractor
+            super().__init__(
+                observation_space,
+                action_space,
+                lr_schedule,
+                features_extractor_class=features_extractor_class,
+                features_extractor_kwargs=features_extractor_kwargs,
+                net_arch=net_arch,
+                activation_fn=activation_fn,
+                **kwargs
+            )
+    
+    # Set the class name for better debugging
+    CustomPolicy.__name__ = policy_name
+    CustomPolicy.__qualname__ = policy_name
+    
+    return CustomPolicy
+
+
+class PolicyRegistry:
+    """
+    Registry to store and retrieve custom policies for different algorithms.
+    
+    This implements the Registry Pattern to manage policy-algorithm combinations
+    dynamically without code duplication.
+    
+    Example:
+        >>> # Register feature extractors
+        >>> PolicyRegistry.register(CustomCNN)
+        >>> PolicyRegistry.register(CustomLSTM)
+        >>> 
+        >>> # Retrieve policies
+        >>> cnn_ppo = PolicyRegistry.get_policy('CustomCNN', 'ppo')
+        >>> lstm_ddpg = PolicyRegistry.get_policy('CustomLSTM', 'ddpg')
+        >>> 
+        >>> # List available policies
+        >>> print(PolicyRegistry.list_policies())
+    """
+    
+    _registry = {}
+    
+    @classmethod
+    def register(cls, extractor_class: Type[BaseFeaturesExtractor], model_names=None):
+        """
+        Register a feature extractor for one or more model types.
+        
+        Args:
+            extractor_class: Feature extractor class (CustomLSTM, CustomCNN, etc.)
+            model_names: List of model names or None for all models
+            
+        Example:
+            >>> PolicyRegistry.register(CustomCNN)  # Register for all models
+            >>> PolicyRegistry.register(CustomLSTM, ['ppo', 'a2c'])  # Only for PPO and A2C
+        """
+        if model_names is None:
+            model_names = list(POLICY_BASES.keys())
+        elif isinstance(model_names, str):
+            model_names = [model_names]
+            
+        extractor_name = extractor_class.__name__
+        
+        for model_name in model_names:
+            policy_class = create_custom_policy(model_name, extractor_class)
+            key = f"{extractor_name}_{model_name}"
+            cls._registry[key] = policy_class
+            print(f"Registered: {key} -> {policy_class.__name__}")
+    
+    @classmethod
+    def get_policy(cls, extractor_name: str, model_name: str) -> Type:
+        """
+        Get a registered policy.
+        
+        Args:
+            extractor_name: Name of feature extractor (e.g., 'CustomLSTM', 'CustomCNN')
+            model_name: Name of RL algorithm (e.g., 'ppo', 'ddpg')
+            
+        Returns:
+            Policy class
+            
+        Raises:
+            KeyError: If policy combination not found
+        """
+        key = f"{extractor_name}_{model_name}"
+        if key not in cls._registry:
+            available = '\n  '.join(cls._registry.keys())
+            raise KeyError(
+                f"Policy '{key}' not found in registry.\n"
+                f"Available policies:\n  {available}"
+            )
+        return cls._registry[key]
+    
+    @classmethod
+    def list_policies(cls):
+        """List all registered policies."""
+        return list(cls._registry.keys())
+    
+    @classmethod
+    def clear_registry(cls):
+        """Clear all registered policies (useful for testing)."""
+        cls._registry.clear()
+
+
+# Convenience functions to get policies for specific feature extractors
+def get_lstm_policy(model_name: str) -> Type:
+    """Get LSTM policy for specified model."""
+    return PolicyRegistry.get_policy('CustomLSTM', model_name)
+
+
+def get_cnn_policy(model_name: str) -> Type:
+    """Get CNN policy for specified model."""
+    return PolicyRegistry.get_policy('CustomCNN', model_name)
+
+
+def get_transformer_policy(model_name: str) -> Type:
+    """Get Transformer policy for specified model."""
+    return PolicyRegistry.get_policy('CustomTransformer', model_name)
+
+
+def get_cnn_lstm_policy(model_name: str) -> Type:
+    """Get CNN-LSTM policy for specified model."""
+    return PolicyRegistry.get_policy('CustomCNNLSTM', model_name)
+
+
+# ============================================================================
+# END OF POLICY FACTORY AND REGISTRY
+# ============================================================================
 
 
 class TensorboardCallback(BaseCallback):
@@ -681,6 +868,29 @@ class CustomLSTMPolicy(ActorCriticPolicy):
             activation_fn=activation_fn,
             **kwargs
         )
+
+
+# ============================================================================
+# AUTO-REGISTER ALL FEATURE EXTRACTORS
+# ============================================================================
+
+# Register all custom feature extractors for all algorithms
+print("=" * 60)
+print("Registering Custom Policies for All RL Algorithms...")
+print("=" * 60)
+
+PolicyRegistry.register(CustomLSTM)
+PolicyRegistry.register(CustomCNN)
+PolicyRegistry.register(CustomTransformer)
+PolicyRegistry.register(CustomCNNLSTM)
+
+print("=" * 60)
+print(f"Total policies registered: {len(PolicyRegistry.list_policies())}")
+print("=" * 60)
+
+# ============================================================================
+# END OF AUTO-REGISTRATION
+# ============================================================================
 
 
 class DRLAgent:
