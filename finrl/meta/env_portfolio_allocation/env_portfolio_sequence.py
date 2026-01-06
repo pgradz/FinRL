@@ -153,6 +153,11 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.actions_memory = [self.current_weights.tolist()]
         self.date_memory = []
         
+        # NEW: Track transaction costs and turnover
+        self.transaction_cost_memory = []
+        self.turnover_memory = []
+        self.cost_memory = [0]  # Total cumulative costs
+        
         # NEW: Historical observation buffer for sequences
         self.observation_buffer = []
         
@@ -301,7 +306,46 @@ class StockPortfolioSequenceEnv(gym.Env):
             return np.stack(self.observation_buffer, axis=0)
 
     def step(self, actions):
-        """Step function with sequence-aware observations."""
+        """
+        Step function with sequence-aware observations and proper transaction cost accounting.
+        
+        Transaction Cost Implementation:
+        ================================
+        
+        Financial Model:
+        ---------------
+        When rebalancing from weights w_old to w_new:
+        
+        1. At end of day T:
+           - Portfolio value = V_T
+           - Current weights = w_old (from previous rebalancing)
+           
+        2. Decide to rebalance to w_new
+           - Turnover = sum(|w_new[i] - w_old[i]|)
+           - This is the fraction of portfolio that must be traded
+           - Example: [0.5, 0.5] -> [0.3, 0.7] has turnover = |0.3-0.5| + |0.7-0.5| = 0.4
+           
+        3. Pay transaction costs
+           - Cost = Turnover × transaction_cost_pct × V_T
+           - V_T_after_cost = V_T - Cost
+           
+        4. Portfolio is now allocated to w_new with value V_T_after_cost
+        
+        5. Market moves on day T+1
+           - Each position earns its return: r[i] = (Price_T+1[i] / Price_T[i]) - 1
+           - Portfolio return = sum(w_new[i] × r[i])
+           - V_T+1 = V_T_after_cost × (1 + portfolio_return)
+           
+        Key Insight:
+        -----------
+        Transaction costs are paid BEFORE market returns. This is the correct
+        temporal ordering and prevents "free rebalancing" where the agent can
+        change allocations costlessly.
+        
+        The agent must learn that rebalancing has a cost, creating an optimal
+        turnover rate: too little and you miss opportunities, too much and you
+        pay excessive costs.
+        """
         self.terminal = self.day >= len(self.df.index.unique()) - 1
 
         if np.all(actions == 0):
@@ -323,6 +367,13 @@ class StockPortfolioSequenceEnv(gym.Env):
             print("=================================")
             print(f"begin_total_asset:{self.asset_memory[0]}")
             print(f"end_total_asset:{self.portfolio_value}")
+            
+            # NEW: Report transaction costs and turnover
+            total_transaction_costs = sum(self.transaction_cost_memory)
+            avg_turnover = np.mean(self.turnover_memory) if len(self.turnover_memory) > 0 else 0
+            print(f"total_transaction_costs: {total_transaction_costs:.2f}")
+            print(f"avg_daily_turnover: {avg_turnover:.4f}")
+            print(f"num_rebalances: {len(self.turnover_memory)}")
 
             df_daily_return = pd.DataFrame(self.portfolio_return_memory)
             df_daily_return.columns = ["daily_return"]
@@ -357,31 +408,60 @@ class StockPortfolioSequenceEnv(gym.Env):
             return self._get_observation(), self.reward, self.terminal, False, {}
 
         else:
-            # Normalize actions to portfolio weights
-            # weights = self.softmax_normalization(actions) - library solution
-            # Store current weights before updating (these were active during current day)
-            
-            # Normalize actions to get new portfolio weights
-            
+            # ================================================================
+            # STEP 1: Normalize actions to get desired new portfolio weights
+            # ================================================================
             total_weight = np.sum(actions)
-            weights = actions / total_weight
-            self.current_weights = weights  # Update current weights
-            self.actions_memory.append(weights)
+            new_weights = actions / total_weight
+            
+            # Store old weights before updating
+            old_weights = self.current_weights.copy()
+            
+            # ================================================================
+            # STEP 2: Calculate transaction costs for rebalancing
+            # ================================================================
+            # Turnover is the sum of absolute weight changes
+            # This represents the fraction of portfolio that needs to be traded
+            turnover = np.sum(np.abs(new_weights - old_weights))
+            
+            # Transaction cost as a percentage of the traded amount
+            # If turnover = 0.5 (50% of portfolio traded) and cost_pct = 0.001 (0.1%)
+            # Then total cost = 0.5 * 0.001 * portfolio_value = 0.0005 * portfolio_value
+            transaction_cost = turnover * self.transaction_cost_pct * self.portfolio_value
+            
+            # Apply transaction cost BEFORE calculating returns
+            # This is the correct sequence: pay to rebalance, then earn returns
+            self.portfolio_value -= transaction_cost
+            
+            # Track costs and turnover for analysis
+            self.transaction_cost_memory.append(transaction_cost)
+            self.turnover_memory.append(turnover)
+            
+            # Update current weights AFTER paying transaction costs
+            self.current_weights = new_weights
+            self.actions_memory.append(new_weights)
+            
+            # ================================================================
+            # STEP 3: Move to next day and calculate market returns
+            # ================================================================
             last_day_memory = self.data
-
-            # Move to next day
             self.day += 1
             self.data = self.df.loc[self.day, :]
             
-            # Calculate portfolio return
+            # Calculate portfolio return based on NEW weights
+            # The portfolio is now allocated according to new_weights
+            # and we observe how it performs with today's price changes
             portfolio_return = sum(
-                ((self.data.close.values / last_day_memory.close.values) - 1) * weights
+                ((self.data.close.values / last_day_memory.close.values) - 1) * new_weights
             )
 
             assert not np.isnan(portfolio_return), "Portfolio return contains NaN values"
             assert not np.isinf(portfolio_return), "Portfolio return contains Inf values"
             
-            # Update portfolio value
+            # ================================================================
+            # STEP 4: Update portfolio value with market returns
+            # ================================================================
+            # Note: portfolio_value was already reduced by transaction_cost above
             new_portfolio_value = self.portfolio_value * (1 + portfolio_return)
             gain = new_portfolio_value - self.portfolio_value
             self.portfolio_value = new_portfolio_value
@@ -445,6 +525,11 @@ class StockPortfolioSequenceEnv(gym.Env):
         
         self.date_memory = []
         self.observation_buffer = []
+        
+        # Reset cost and turnover tracking
+        self.transaction_cost_memory = []
+        self.turnover_memory = []
+        self.cost_memory = [0]
 
         # Reset DSR states
         self.dsr_a = 0.0
@@ -468,12 +553,21 @@ class StockPortfolioSequenceEnv(gym.Env):
         return softmax_output
 
     def save_asset_memory(self):
-        """Save asset memory to DataFrame."""
+        """Save asset memory to DataFrame with transaction costs and turnover."""
         date_list = self.date_memory
         portfolio_return = self.portfolio_return_memory
-        df_account_value = pd.DataFrame(
-            {"date": date_list, "daily_return": portfolio_return, "account_value": self.asset_memory}
-        )
+        
+        # Pad transaction costs to match dates (first entry has no rebalancing)
+        transaction_costs = [0] + self.transaction_cost_memory
+        turnover = [0] + self.turnover_memory
+        
+        df_account_value = pd.DataFrame({
+            "date": date_list, 
+            "daily_return": portfolio_return, 
+            "account_value": self.asset_memory,
+            "transaction_cost": transaction_costs[:len(date_list)],
+            "turnover": turnover[:len(date_list)]
+        })
         return df_account_value
 
     def save_action_memory(self):
