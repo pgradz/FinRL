@@ -281,6 +281,9 @@ class CustomLSTM(BaseFeaturesExtractor):
         else:
             raise ValueError(f"Unsupported observation space shape: {obs_shape}")
 
+        # LayerNorm for input normalization (normalizes across feature dimension)
+        self.input_norm = nn.LayerNorm(self.input_size)
+
         self.lstm = nn.LSTM(
             input_size=self.input_size,
             hidden_size=lstm_hidden_size,
@@ -308,6 +311,9 @@ class CustomLSTM(BaseFeaturesExtractor):
         elif observations.dim() == 2:
             # Add sequence dimension if missing
             observations = observations.view(batch_size, self.sequence_length, self.input_size)
+        
+        # Apply LayerNorm to normalize input features
+        observations = self.input_norm(observations)
         
         # Initialize hidden states
         h_0 = torch.zeros(self.num_layers, batch_size, self.lstm_hidden_size, 
@@ -405,6 +411,9 @@ class CustomTransformer(BaseFeaturesExtractor):
         else:
             raise ValueError(f"Unsupported observation space shape: {obs_shape}")
         
+        # LayerNorm for input normalization (normalizes across feature dimension)
+        self.input_norm = nn.LayerNorm(self.input_size)
+        
         # Input projection to embedding dimension
         self.input_projection = nn.Linear(self.input_size, embed_dim)
         
@@ -459,8 +468,11 @@ class CustomTransformer(BaseFeaturesExtractor):
         
         seq_len = observations.shape[1]
         
+        # Apply LayerNorm to normalize input features
+        x = self.input_norm(observations)
+        
         # Project to embedding dimension
-        x = self.input_projection(observations)  # (batch_size, seq_len, embed_dim)
+        x = self.input_projection(x)  # (batch_size, seq_len, embed_dim)
         
         # Add positional encoding
         if seq_len <= self.positional_encoding.shape[0]:
@@ -510,6 +522,9 @@ class CustomCNN(BaseFeaturesExtractor):
             self.reshape_needed = False
         else:
             raise ValueError(f"Unsupported observation space shape: {obs_shape}")
+        
+        # LayerNorm for input normalization (normalizes across feature dimension)
+        self.input_norm = nn.LayerNorm(self.input_size)
         
         # Build CNN layers
         layers = []
@@ -569,11 +584,16 @@ class CustomCNN(BaseFeaturesExtractor):
             observations = observations.view(batch_size, self.input_size, 1)
         elif observations.dim() == 3:  # ← FIXED: Check for 3D tensor
             # Input: (batch_size, sequence_length, input_size) = (1, 20, 290)
+            # Apply LayerNorm before transposing
+            observations = self.input_norm(observations)
             # Conv1d expects: (batch_size, input_size, sequence_length) = (1, 290, 20)
             observations = observations.transpose(1, 2)  # Swap dimensions 1 and 2
         elif observations.dim() == 2:
             # FIXED: Correct reshaping for Conv1d
             # Input: (batch_size, sequence_length, input_size) = (1, 20, 290)
+            observations = observations.view(batch_size, self.sequence_length, self.input_size)
+            # Apply LayerNorm
+            observations = self.input_norm(observations)
             # Conv1d expects: (batch_size, input_size, sequence_length) = (1, 290, 20)
             observations = observations.transpose(1, 2)  # Swap dimensions 1 and 2
         
@@ -623,6 +643,9 @@ class CustomCNNLSTM(BaseFeaturesExtractor):
             self.reshape_needed = False
         else:
             raise ValueError(f"Unsupported observation space shape: {obs_shape}")
+        
+        # LayerNorm for input normalization (normalizes across feature dimension)
+        self.input_norm = nn.LayerNorm(self.input_size)
         
         # Build CNN layers for local pattern detection
         cnn_layers = []
@@ -678,11 +701,15 @@ class CustomCNNLSTM(BaseFeaturesExtractor):
             observations = observations.view(batch_size, self.input_size, 1)
         elif observations.dim() == 3:  # ← FIXED: Check for 3D tensor first
             # Input: (batch_size, sequence_length, input_size) = (1, 20, 290)
+            # Apply LayerNorm before transposing
+            observations = self.input_norm(observations)
             # Conv1d expects: (batch_size, input_size, sequence_length) = (1, 290, 20)
             observations = observations.transpose(1, 2)
         elif observations.dim() == 2:
             # This would be for already flattened observations
             observations = observations.view(batch_size, self.sequence_length, self.input_size)
+            # Apply LayerNorm
+            observations = self.input_norm(observations)
             observations = observations.transpose(1, 2)
         else:
             raise ValueError(f"Unsupported observation shape: {observations.shape}")

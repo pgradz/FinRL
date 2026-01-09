@@ -409,7 +409,7 @@ class StockPortfolioSequenceEnv(gym.Env):
 
         else:
             # ================================================================
-            # STEP 1: Normalize actions to get desired new portfolio weights
+            # STEP 1: Normalize softmax_normalization to get desired new portfolio weights
             # ================================================================
             total_weight = np.sum(actions)
             new_weights = actions / total_weight
