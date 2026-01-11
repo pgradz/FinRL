@@ -46,7 +46,8 @@ class StockPortfolioSequenceEnv(gym.Env):
         include_returns=False,  # NEW: Include historical returns in observations
         include_volume=False,  # NEW: Include volume data,
         dsr_eta: float = 0.1, # NEW: Update rate for Differential Sharpe Ratio
-        reward_type: str = "pnl",  # NEW: Reward function type: 'pnl' or 'sharpe' or dsr
+        reward_type: str = "pnl",  # NEW: Reward function type: 'pnl', 'sharpe', 'dsr', or 'log_return'
+        log_return_window: int = 20,  # NEW: Window for averaging log returns
         model_name="",
         mode="",
         iteration="",
@@ -86,6 +87,7 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.include_volume = include_volume
         self.reward_type = reward_type
         self.dsr_eta = dsr_eta
+        self.log_return_window = log_return_window
 
         # for muliple runs
         self.model_name = model_name
@@ -168,6 +170,9 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.dsr_a = 0.0
         self.dsr_b = 0.0
         self.last_sharpe = 0.0
+        
+        # NEW: Initialize log return memory for log_return reward
+        self.log_return_memory = []
 
     def _initialize_observation_buffer(self):
         """Initialize the observation buffer with historical data."""
@@ -476,8 +481,39 @@ class StockPortfolioSequenceEnv(gym.Env):
             self.date_memory.append(self.data.date.unique()[0])
             self.asset_memory.append(new_portfolio_value)
 
-            # Reward is the gain
-            if self.reward_type == "dsr":
+            # ================================================================
+            # STEP 5: Calculate reward based on reward_type
+            # ================================================================
+            if self.reward_type == "log_return":
+                # Logarithmic return reward - Kelly optimal for long-term growth
+                if len(self.asset_memory) > 1:
+                    # Current log return
+                    current_log_return = np.log(self.asset_memory[-1] / self.asset_memory[-2])
+                    
+                    # Store for averaging
+                    self.log_return_memory.append(current_log_return)
+                    
+                    # Average over window (smooths noise, encourages consistent growth)
+                    if len(self.log_return_memory) >= self.log_return_window:
+                        # Use exponential moving average for recent bias
+                        weights = np.exp(np.linspace(-1, 0, len(self.log_return_memory[-self.log_return_window:])))
+                        weights = weights / weights.sum()
+                        avg_log_return = np.average(
+                            self.log_return_memory[-self.log_return_window:],
+                            weights=weights
+                        )
+                        self.reward = avg_log_return
+                    else:
+                        # Not enough history yet - use simple average
+                        self.reward = np.mean(self.log_return_memory)
+                    
+                    # Scale up for better gradient magnitude
+                    self.reward *= 100  # Convert to percentage-like scale
+                else:
+                    self.reward = 0.0
+            
+            elif self.reward_type == "dsr":
+                # Differential Sharpe Ratio - rewards improvements in Sharpe ratio
                 if len(self.asset_memory) > 1:
                     current_return = (self.asset_memory[-1] / self.asset_memory[-2]) - 1
                     
@@ -495,7 +531,22 @@ class StockPortfolioSequenceEnv(gym.Env):
                         self.reward = 0.0
                 else:
                     self.reward = 0.0
-            else:
+            
+            elif self.reward_type == "sharpe":
+                # Rolling Sharpe ratio
+                if len(self.portfolio_return_memory) >= 20:
+                    recent_returns = self.portfolio_return_memory[-20:]
+                    mean_return = np.mean(recent_returns)
+                    std_return = np.std(recent_returns)
+                    if std_return != 0:
+                        self.reward = (mean_return / std_return) * np.sqrt(252)
+                    else:
+                        self.reward = 0.0
+                else:
+                    self.reward = portfolio_return
+            
+            else:  # "pnl" or default
+                # Simple profit and loss
                 self.reward = gain
             
             assert not np.isnan(self.reward), "Reward contains NaN values"
@@ -535,6 +586,9 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.dsr_a = 0.0
         self.dsr_b = 0.0
         self.last_sharpe = 0.0
+        
+        # Reset log return memory
+        self.log_return_memory = []
         
         # Initialize observation buffer
         self._initialize_observation_buffer()
