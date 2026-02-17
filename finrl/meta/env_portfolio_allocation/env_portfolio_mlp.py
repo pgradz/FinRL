@@ -12,15 +12,22 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 matplotlib.use("Agg")
 
 
-class StockPortfolioSequenceEnv(gym.Env):
+class StockPortfolioMLPEnv(gym.Env):
     """
-    A sequence-aware portfolio allocation environment for temporal models (LSTM, CNN, Transformer, CNN-LSTM).
+    A single-timestep portfolio allocation environment for MLP models.
     
-    Key Changes from Original:
-    1. Maintains a rolling window of historical observations
-    2. Observation space is 3D: (sequence_length, features, stocks) or flattened to 2D
-    3. Supports both 2D and 1D observation formats for different models
-    4. Backward compatible with existing models via flatten_observations parameter
+    This environment is aligned with StockPortfolioSequenceEnv but WITHOUT temporal sequences.
+    Perfect for benchmarking MLP vs sequence models (LSTM, CNN, Transformer, CNN-LSTM).
+    
+    Key Features:
+    1. Single-timestep observations (no rolling window)
+    2. Same state structure as sequence environment
+    3. Support for macro features
+    4. Multiple reward types (PnL, DSR, Sharpe)
+    5. Proper transaction cost accounting
+    6. NO covariance matrix (unlike original env_portfolio.py)
+    
+    This creates a fair comparison: MLP vs sequence models with identical features.
     """
 
     metadata = {"render.modes": ["human"]}
@@ -39,32 +46,47 @@ class StockPortfolioSequenceEnv(gym.Env):
         turbulence_threshold=None,
         lookback=252,
         day=0,
-        initial = True,
-        previous_state = [],
-        sequence_length=20,  # NEW: Length of historical sequence
-        flatten_observations=False,  # NEW: Whether to flatten for MLP models
-        include_returns=False,  # NEW: Include historical returns in observations
-        include_volume=False,  # NEW: Include volume data,
-        dsr_eta: float = 0.1, # NEW: Update rate for Differential Sharpe Ratio
-        reward_type: str = "pnl",  # NEW: Reward function type: 'pnl', 'sharpe', 'dsr', or 'log_return'
-        log_return_window: int = 20,  # NEW: Window for averaging log returns
+        initial=True,
+        previous_state=[],
+        include_returns=False,  # Include previous day returns in state
+        include_volume=False,  # Include volume data
+        dsr_eta: float = 0.1,  # Update rate for Differential Sharpe Ratio
+        reward_type: str = "pnl",  # Reward function type: 'pnl', 'sharpe', 'dsr', or 'log_return'
+        log_return_window: int = 20,  # Window for averaging log returns
         model_name="",
         mode="",
         iteration="",
         seed=""
-
     ):
         """
-        Initialize the sequence-aware portfolio environment.
+        Initialize the MLP portfolio environment.
         
-        State Structure (following stock trading env pattern):
-        [portfolio_value, stock1_price, stock2_price, ..., weight1, weight2, ..., tech_indicators...]
+        State Structure (aligned with sequence env):
+        [stock_prices, portfolio_weights, tech_indicators, returns?, volume?, macro_features, portfolio_value]
         
         Args:
-            sequence_length: Number of historical days to include in observations
-            flatten_observations: If True, flatten to 1D for MLP models. If False, keep 2D for sequence models
-            include_returns: Whether to include historical returns
+            df: DataFrame with stock data
+            macro_df: DataFrame with macro-economic indicators (optional)
+            stock_dim: Number of stocks
+            hmax: Maximum shares to trade (legacy, not used in portfolio allocation)
+            initial_amount: Starting portfolio value
+            transaction_cost_pct: Transaction cost as percentage (e.g., 0.001 = 0.1%)
+            reward_scaling: Scaling factor for rewards
+            action_space: Dimension of action space (should equal stock_dim)
+            tech_indicator_list: List of technical indicator names
+            turbulence_threshold: Threshold for risk aversion (optional)
+            lookback: Lookback period for calculations
+            day: Starting day index
+            initial: Whether this is initial state
+            previous_state: State from previous episode (for continuation)
+            include_returns: Whether to include previous day returns
             include_volume: Whether to include volume information
+            dsr_eta: Learning rate for Differential Sharpe Ratio
+            reward_type: Type of reward function ('pnl', 'dsr', 'sharpe')
+            model_name: Name of model (for logging)
+            mode: Mode of operation (for logging)
+            iteration: Iteration number (for logging)
+            seed: Random seed (for logging)
         """
         self.day = day
         self.lookback = lookback
@@ -80,23 +102,21 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.initial = initial
         self.previous_state = previous_state
         
-        # NEW: Sequence parameters
-        self.sequence_length = sequence_length
-        self.flatten_observations = flatten_observations
+        # Feature flags (aligned with sequence env)
         self.include_returns = include_returns
         self.include_volume = include_volume
         self.reward_type = reward_type
         self.dsr_eta = dsr_eta
         self.log_return_window = log_return_window
 
-        # for muliple runs
+        # For multiple runs
         self.model_name = model_name
         self.mode = mode
         self.iteration = iteration
         self.seed = seed
         
-        # Calculate state dimensions (1D like stock trading env)
-        # State: [portfolio_value, prices, weights, tech_indicators, returns?, volume?]
+        # Calculate state dimensions (same as sequence env but without sequence dimension)
+        # State: [prices, weights, tech_indicators, returns?, volume?, macro_features, portfolio_value]
         base_features_per_stock = len(self.tech_indicator_list)
         if self.include_returns:
             base_features_per_stock += 1
@@ -105,33 +125,24 @@ class StockPortfolioSequenceEnv(gym.Env):
 
         # Macro features
         if self.macro_df is not None:
-            macro_features = self.macro_df.shape[1] - 1 # subtract date column
+            macro_features = self.macro_df.shape[1] - 1  # subtract date column
             self.validate_macro_alignment()
         else:
             macro_features = 0
 
-        # Total state dimension:  prices + weights + tech_features * stocks + portfolio_value + macro_features
+        # Total state dimension: prices + weights + tech_features * stocks + portfolio_value + macro_features
         self.state_dim = self.stock_dim + self.stock_dim + (base_features_per_stock * self.stock_dim) + 1 + macro_features
 
         # Action space: portfolio weights (softmax normalized)
         self.action_space = spaces.Box(low=0, high=1, shape=(action_space,))
         
-        # NEW: Observation space design
-        if self.flatten_observations:
-            # For MLP models: flatten sequence to 1D
-            obs_dim = self.sequence_length * self.state_dim
-            self.observation_space = spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-                shape=(obs_dim,)
-            )
-        else:
-            # For sequence models: (sequence_length, state_features)
-            self.observation_space = spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-                shape=(self.sequence_length, self.state_dim)
-            )
+        # Observation space: single timestep (1D vector)
+        # This is the key difference from sequence env - no sequence dimension!
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(self.state_dim,)
+        )
         
         # Initialize environment
         self.terminal = False
@@ -140,12 +151,11 @@ class StockPortfolioSequenceEnv(gym.Env):
         # Initialize portfolio weights - START WITH 100% CASH (0% allocation to all assets)
         if self.initial:
             self.current_weights = np.array([0.0] * self.stock_dim)
-        else: 
-        # extract weights from the last step (sequence length) of the previous state, 
-        # state is an array [sequence length, list of stock prices for len(daily_data.tic.unique()) 
-        # followed by weights for len(daily_data.tic.unique()) stocks and then followed by some indicators]
-            self.current_weights = np.array(self.previous_state[-1][self.stock_dim:2*self.stock_dim])
-            self.initial_amount = self.previous_state[-1][-1]
+        else:
+            # Extract weights from previous state
+            # State structure: [prices, weights, tech_indicators, ...]
+            self.current_weights = np.array(self.previous_state[self.stock_dim:2*self.stock_dim])
+            self.initial_amount = self.previous_state[-1]
 
         self.portfolio_value = self.initial_amount
 
@@ -155,118 +165,93 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.actions_memory = [self.current_weights.tolist()]
         self.date_memory = []
         
-        # NEW: Track transaction costs and turnover
+        # Track transaction costs and turnover
         self.transaction_cost_memory = []
         self.turnover_memory = []
         self.cost_memory = [0]  # Total cumulative costs
         
-        # NEW: Historical observation buffer for sequences
-        self.observation_buffer = []
-        
         # Initialize with first observation
-        self._initialize_observation_buffer()
+        self.data = self.df.loc[self.day, :]
+        self.date_memory = [self.data.date.unique()[0]]
 
-        # NEW: Initialize state for Differential Sharpe Ratio
+        # Initialize state for Differential Sharpe Ratio
         self.dsr_a = 0.0
         self.dsr_b = 0.0
         self.last_sharpe = 0.0
         
-        # NEW: Initialize log return memory for log_return reward
+        # Initialize log return memory for log_return reward
         self.log_return_memory = []
 
-    def _initialize_observation_buffer(self):
-        """Initialize the observation buffer with historical data."""
-        start_idx = max(0, self.day - self.sequence_length + 1)
-        
-        for i in range(start_idx, self.day + 1):
-            if i < len(self.df.index.unique()):
-                daily_data = self.df.loc[i, :]
-                obs = self._build_daily_observation(daily_data, i)
-                self.observation_buffer.append(obs)
-        
-        # Pad if we don't have enough historical data
-        while len(self.observation_buffer) < self.sequence_length:
-            # Duplicate first observation for padding
-            self.observation_buffer.insert(0, self.observation_buffer[0].copy())
-        
-        # Keep only the last sequence_length observations
-        self.observation_buffer = self.observation_buffer[-self.sequence_length:]
-        
-        # Set current data and date memory
-        self.data = self.df.loc[self.day, :]
-        self.date_memory = [self.data.date.unique()[0]]
-
-    def _build_daily_observation(self, daily_data, day_idx):
+    def _build_observation(self):
         """
-        Build observation for a single day following stock trading env pattern.
+        Build observation for current day (aligned with sequence env).
         
-        IMPROVED State Structure: [stock_prices, portfolio_weights, tech_indicators, returns?, volume?]
-        (Removed portfolio_value as it's not actionable)
+        State Structure: [stock_prices, portfolio_weights, tech_indicators, returns?, volume?, macro_features, portfolio_value]
         
         Returns:
-            np.array: 1D state vector for one timestep
+            np.array: 1D state vector for current timestep
         """
         state = []
         
         # 1. Current stock prices (market state)
-        if len(daily_data.tic.unique()) > 1:
-            state.extend(daily_data.close.values.tolist())
+        if len(self.data.tic.unique()) > 1:
+            state.extend(self.data.close.values.tolist())
         else:
-            state.append(daily_data.close.iloc[0])
+            state.append(self.data.close.iloc[0])
         
         # 2. Current portfolio weights (allocation state)
         state.extend(self.current_weights.tolist())
         
         # 3. Technical indicators for all stocks (market sentiment/momentum)
         for tech in self.tech_indicator_list:
-            if len(daily_data.tic.unique()) > 1:
-                state.extend(daily_data[tech].values.tolist())
+            if len(self.data.tic.unique()) > 1:
+                state.extend(self.data[tech].values.tolist())
             else:
-                state.append(daily_data[tech].iloc[0])
+                state.append(self.data[tech].iloc[0])
 
         # 4. Returns (if enabled) - market performance
         if self.include_returns:
-            if day_idx > 0:
-                prev_data = self.df.loc[day_idx - 1, :]
-                if len(daily_data.tic.unique()) > 1:
-                    returns = (daily_data.close.values / prev_data.close.values) - 1
+            if self.day > 0:
+                prev_data = self.df.loc[self.day - 1, :]
+                if len(self.data.tic.unique()) > 1:
+                    returns = (self.data.close.values / prev_data.close.values) - 1
                     state.extend(returns.tolist())
                 else:
-                    returns = (daily_data.close.iloc[0] / prev_data.close.iloc[0]) - 1
+                    returns = (self.data.close.iloc[0] / prev_data.close.iloc[0]) - 1
                     state.append(returns)
             else:
                 # First day: zero returns
-                if len(daily_data.tic.unique()) > 1:
+                if len(self.data.tic.unique()) > 1:
                     state.extend([0.0] * self.stock_dim)
                 else:
                     state.append(0.0)
 
         # 5. Volume (if enabled and available) - market liquidity
         if self.include_volume:
-            if 'volume' in daily_data.columns:
-                if len(daily_data.tic.unique()) > 1:
-                    volumes = daily_data.volume.values
+            if 'volume' in self.data.columns:
+                if len(self.data.tic.unique()) > 1:
+                    volumes = self.data.volume.values
                     # Normalize volume to prevent scale issues
                     normalized_volumes = np.log(volumes + 1)
                     state.extend(normalized_volumes.tolist())
                 else:
-                    volume = daily_data.volume.iloc[0]
+                    volume = self.data.volume.iloc[0]
                     normalized_volume = np.log(volume + 1)
                     state.append(normalized_volume)
             else:
                 # If volume not available, use zeros
-                if len(daily_data.tic.unique()) > 1:
+                if len(self.data.tic.unique()) > 1:
                     state.extend([0.0] * self.stock_dim)
                 else:
                     state.append(0.0)
 
         # 6. Macro features (if available) - economic context
         if self.macro_df is not None:
-            # Get the actual date from the current daily_data
-            if len(daily_data.tic.unique()) > 1:
-                current_date = daily_data.date.unique()[0]
+            # Get the actual date from the current data
+            if len(self.data.tic.unique()) > 1:
+                current_date = self.data.date.unique()[0]
             else:
-                current_date = daily_data.date.iloc[0]
+                current_date = self.data.date.iloc[0]
             
             # Find matching row in macro_df by date
             macro_row = self.macro_df[self.macro_df['date'] == current_date]
@@ -288,31 +273,17 @@ class StockPortfolioSequenceEnv(gym.Env):
                     macro_feature_count = self.macro_df.shape[1] - 1  # subtract date column
                     state.extend([0.0] * macro_feature_count)
 
-        # 7. current portfolio worth - has to be on the last place
+        # 7. Current portfolio value - has to be on the last place
         state.append(self.portfolio_value)
 
         if len(state) != self.state_dim:
-            print(f"ERROR: State dimension mismatch!")
+            print(f"ERROR: State dimension mismatch! Expected {self.state_dim}, got {len(state)}")
         
         return np.array(state)
-    
-    def _get_observation(self):
-        """
-        Get the current observation (sequence of historical data).
-        
-        Returns:
-            np.array: Observation in the format expected by the model
-        """
-        if self.flatten_observations:
-            # Flatten everything to 1D for MLP models
-            return np.concatenate(self.observation_buffer)
-        else:
-            # Stack as 2D array for sequence models: (sequence_length, features)
-            return np.stack(self.observation_buffer, axis=0)
 
     def step(self, actions):
         """
-        Step function with sequence-aware observations and proper transaction cost accounting.
+        Step function with proper transaction cost accounting (aligned with sequence env).
         
         Transaction Cost Implementation:
         ================================
@@ -346,10 +317,6 @@ class StockPortfolioSequenceEnv(gym.Env):
         Transaction costs are paid BEFORE market returns. This is the correct
         temporal ordering and prevents "free rebalancing" where the agent can
         change allocations costlessly.
-        
-        The agent must learn that rebalancing has a cost, creating an optimal
-        turnover rate: too little and you miss opportunities, too much and you
-        pay excessive costs.
         """
         self.terminal = self.day >= len(self.df.index.unique()) - 1
 
@@ -373,7 +340,7 @@ class StockPortfolioSequenceEnv(gym.Env):
             print(f"begin_total_asset:{self.asset_memory[0]}")
             print(f"end_total_asset:{self.portfolio_value}")
             
-            # NEW: Report transaction costs and turnover
+            # Report transaction costs and turnover
             total_transaction_costs = sum(self.transaction_cost_memory)
             avg_turnover = np.mean(self.turnover_memory) if len(self.turnover_memory) > 0 else 0
             print(f"total_transaction_costs: {total_transaction_costs:.2f}")
@@ -410,11 +377,11 @@ class StockPortfolioSequenceEnv(gym.Env):
                     index=False,
                 )
 
-            return self._get_observation(), self.reward, self.terminal, False, {}
+            return self._build_observation(), self.reward, self.terminal, False, {}
 
         else:
             # ================================================================
-            # STEP 1: Normalize softmax_normalization to get desired new portfolio weights
+            # STEP 1: Normalize actions to get desired new portfolio weights
             # ================================================================
             total_weight = np.sum(actions)
             new_weights = actions / total_weight
@@ -470,11 +437,6 @@ class StockPortfolioSequenceEnv(gym.Env):
             new_portfolio_value = self.portfolio_value * (1 + portfolio_return)
             gain = new_portfolio_value - self.portfolio_value
             self.portfolio_value = new_portfolio_value
-
-            # NEW: Update observation buffer with new state
-            new_obs = self._build_daily_observation(self.data, self.day)
-            self.observation_buffer.append(new_obs)
-            self.observation_buffer = self.observation_buffer[-self.sequence_length:]  # Keep only last N observations
 
             # Save to memory
             self.portfolio_return_memory.append(portfolio_return)
@@ -552,15 +514,15 @@ class StockPortfolioSequenceEnv(gym.Env):
             assert not np.isnan(self.reward), "Reward contains NaN values"
             assert not np.isinf(self.reward), "Reward contains Inf values"
 
-            # Validate observation
-            observation = self._get_observation()
+            # Build current observation
+            observation = self._build_observation()
             assert not np.any(np.isnan(observation)), "Observation contains NaN values"
             assert not np.any(np.isinf(observation)), "Observation contains Inf values"
 
         return observation, self.reward, self.terminal, False, {}
 
     def reset(self, *, seed=None, options=None):
-        """Reset environment with sequence buffer initialization."""
+        """Reset environment to initial state."""
         self.asset_memory = [self.initial_amount]
         self.day = 0
         self.portfolio_value = self.initial_amount
@@ -569,13 +531,13 @@ class StockPortfolioSequenceEnv(gym.Env):
 
         if self.initial:
             self.current_weights = np.array([0.0] * self.stock_dim)
-        else: 
-            self.current_weights = np.array(self.previous_state[-1][self.stock_dim:2*self.stock_dim])
+        else:
+            # Extract weights from previous state
+            self.current_weights = np.array(self.previous_state[self.stock_dim:2*self.stock_dim])
 
         self.actions_memory = [self.current_weights.tolist()]
         
         self.date_memory = []
-        self.observation_buffer = []
         
         # Reset cost and turnover tracking
         self.transaction_cost_memory = []
@@ -590,14 +552,15 @@ class StockPortfolioSequenceEnv(gym.Env):
         # Reset log return memory
         self.log_return_memory = []
         
-        # Initialize observation buffer
-        self._initialize_observation_buffer()
+        # Initialize current data
+        self.data = self.df.loc[self.day, :]
+        self.date_memory = [self.data.date.unique()[0]]
         
-        return self._get_observation(), {}
+        return self._build_observation(), {}
 
     def render(self, mode="human"):
         """Render current state."""
-        return self._get_observation()
+        return self._build_observation()
 
     def softmax_normalization(self, actions):
         """Softmax normalization for portfolio weights."""
