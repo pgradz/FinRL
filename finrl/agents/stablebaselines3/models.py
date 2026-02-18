@@ -1177,8 +1177,17 @@ class DRLAgent:
         train_env_gym = env_constructor(train_df, **env_kwargs)
         env_train, _ = train_env_gym.get_sb_env()
 
-        # Build the validation env
-        val_env_gym = env_constructor(val_df, **env_kwargs)
+        # Extract normalization stats from training env to prevent data leakage
+        norm_stats = None
+        if hasattr(train_env_gym, 'get_normalization_stats'):
+            norm_stats = train_env_gym.get_normalization_stats()
+
+        # Build the validation env with training normalization stats
+        val_env_kwargs = dict(env_kwargs)
+        if norm_stats is not None:
+            val_env_kwargs['normalization_stats'] = norm_stats
+        val_env_kwargs['random_start'] = False  # Deterministic evaluation
+        val_env_gym = env_constructor(val_df, **val_env_kwargs)
         env_val, _ = val_env_gym.get_sb_env()
 
         # Create all combinations of model params and policy kwargs
@@ -1250,7 +1259,7 @@ class DRLAgent:
                 iteration=combination_idx,
                 model_name=f"{model_name}_final",  # or some suffix
                 mode="validation",
-                **env_kwargs
+                **(val_env_kwargs)
             )
             val_env_final_vec = DummyVecEnv([lambda: val_env_final])
             # short rollout
@@ -1271,7 +1280,7 @@ class DRLAgent:
                 iteration=combination_idx,
                 model_name=f"{model_name}_ckpt",  # or some suffix
                 mode="validation",
-                **env_kwargs
+                **(val_env_kwargs)
             )
             val_env_ckpt_vec = DummyVecEnv([lambda: val_env_ckpt])
             self._run_env_to_end(best_model_checkpoint, val_env_ckpt_vec)
@@ -1451,11 +1460,19 @@ class DRLAgent:
 
             # Build train env
             train_env_gym = env_constructor(train_df, **env_kwargs)
+            # Extract normalization stats from training data to prevent data leakage
+            norm_stats = None
+            if hasattr(train_env_gym, 'get_normalization_stats'):
+                norm_stats = train_env_gym.get_normalization_stats()
             env_train, _ = train_env_gym.get_sb_env()
             env_train.seed(seed)
 
-            # Build val env
-            val_env_gym = env_constructor(val_df, **env_kwargs)
+            # Build val env (with training normalization stats to prevent data leakage)
+            val_kwargs = dict(**env_kwargs)
+            if norm_stats is not None:
+                val_kwargs['normalization_stats'] = norm_stats
+            val_kwargs['random_start'] = False  # Deterministic evaluation
+            val_env_gym = env_constructor(val_df, **val_kwargs)
             env_val, _ = val_env_gym.get_sb_env()
             env_val.seed(seed)
 
@@ -1503,13 +1520,17 @@ class DRLAgent:
 
             # (A) Rollout final model => environment with mode="validation"
             # Use a suffix in model_name so we don't overwrite checkpoint CSV
+            val_final_kwargs = dict(**env_kwargs)
+            if norm_stats is not None:
+                val_final_kwargs['normalization_stats'] = norm_stats
+            val_final_kwargs['random_start'] = False  # Deterministic evaluation
             val_env_gym_final = env_constructor(
                 val_df,
                 iteration=iteration_no,
                 seed = seed,
                 model_name=f"{model_name}_final",  # e.g. "ppo_final"
                 mode="validation",
-                **env_kwargs
+                **val_final_kwargs
             )
             val_env_final = DummyVecEnv([lambda: val_env_gym_final])
             val_env_final.seed(seed)
@@ -1519,13 +1540,17 @@ class DRLAgent:
             final_sharpe = self.get_validation_sharpe_custom(file_final)
 
              # (B) Rollout checkpoint model => environment with mode="validation"
+            val_ckpt_kwargs = dict(**env_kwargs)
+            if norm_stats is not None:
+                val_ckpt_kwargs['normalization_stats'] = norm_stats
+            val_ckpt_kwargs['random_start'] = False  # Deterministic evaluation
             val_env_gym_ckpt = env_constructor(
                 val_df,
                 iteration=iteration_no,
                 seed = seed,
                 model_name=f"{model_name}_ckpt",   # e.g. "ppo_ckpt"
                 mode="validation",
-                **env_kwargs
+                **val_ckpt_kwargs
             )
             val_env_ckpt = DummyVecEnv([lambda: val_env_gym_ckpt])
             val_env_ckpt.seed(seed)
@@ -1575,7 +1600,11 @@ class DRLAgent:
                 break
 
             # 7) Reuse DRL_prediction => collects account_memory & actions_memory
-            trade_env_gym = env_constructor(trade_df, **env_kwargs, initial=initial, previous_state=last_state)
+            trade_kwargs = dict(**env_kwargs)
+            if norm_stats is not None:
+                trade_kwargs['normalization_stats'] = norm_stats
+            trade_kwargs['random_start'] = False  # Deterministic evaluation for OOS trading
+            trade_env_gym = env_constructor(trade_df, **trade_kwargs, initial=initial, previous_state=last_state)
             account_mem, actions_mem, last_state = self.DRL_prediction(best_policy, trade_env_gym, deterministic=True)
             initial = False
             # We can store these in lists for later analysis.
@@ -1659,22 +1688,28 @@ class DRLAgent:
 
         for i in range(len(environment.df.index.unique())):
             action, _states = model.predict(test_obs, deterministic=deterministic)
-            # account_memory = test_env.env_method(method_name="save_asset_memory")
-            # actions_memory = test_env.env_method(method_name="save_action_memory")
             test_obs, rewards, dones, info = test_env.step(action)
 
-            if (
-                i == max_steps - 1
-            ):  # more descriptive condition for early termination to clarify the logic
+            if i == max_steps - 1 or dones[0]:
+                # Save memory at end of episode (either natural end or early termination)
                 account_memory = test_env.env_method(method_name="save_asset_memory")
                 actions_memory = test_env.env_method(method_name="save_action_memory")
-                last_state = test_env.envs[0].render()
-            # add current state to state memory
-            # state_memory=test_env.env_method(method_name="save_state_memory")
-
-            if dones[0]:
-                print("hit end!")
+                # Use get_terminal_state() for explicit portfolio_value & weights handoff
+                # (render() returns normalized observation which can't be parsed for portfolio_value)
+                inner_env = test_env.envs[0]
+                if hasattr(inner_env, 'get_terminal_state'):
+                    last_state = inner_env.get_terminal_state()
+                else:
+                    last_state = inner_env.render()  # legacy fallback
+                if dones[0]:
+                    print("hit end!")
                 break
+
+        if account_memory is None:
+            raise RuntimeError(
+                f"DRL_prediction: episode never terminated. "
+                f"max_steps={max_steps}, iterations={i}"
+            )
         return account_memory[0], actions_memory[0], last_state
 
     @staticmethod

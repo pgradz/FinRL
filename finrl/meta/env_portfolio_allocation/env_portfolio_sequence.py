@@ -46,8 +46,10 @@ class StockPortfolioSequenceEnv(gym.Env):
         include_returns=False,  # NEW: Include historical returns in observations
         include_volume=False,  # NEW: Include volume data,
         dsr_eta: float = 0.1, # NEW: Update rate for Differential Sharpe Ratio
-        reward_type: str = "pnl",  # NEW: Reward function type: 'pnl', 'sharpe', 'dsr', or 'log_return'
+        reward_type: str = "pnl",  # NEW: Reward function type: 'pnl', 'sharpe', 'dsr', 'log_return', or 'active_return'
         log_return_window: int = 20,  # NEW: Window for averaging log returns
+        random_start: bool = False,  # NEW: Random episode start for training diversity
+        normalization_stats: dict = None,  # Pre-computed stats from training env (prevents data leakage)
         model_name="",
         mode="",
         iteration="",
@@ -88,6 +90,8 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.reward_type = reward_type
         self.dsr_eta = dsr_eta
         self.log_return_window = log_return_window
+        self.random_start = random_start
+        self._normalization_stats = normalization_stats  # externally provided stats
 
         # for muliple runs
         self.model_name = model_name
@@ -113,8 +117,19 @@ class StockPortfolioSequenceEnv(gym.Env):
         # Total state dimension:  prices + weights + tech_features * stocks + portfolio_value + macro_features
         self.state_dim = self.stock_dim + self.stock_dim + (base_features_per_stock * self.stock_dim) + 1 + macro_features
 
-        # Action space: portfolio weights (softmax normalized)
-        self.action_space = spaces.Box(low=0, high=1, shape=(action_space,))
+        # Action space: [0, 1] per asset, normalized to portfolio weights in step()
+        # SB3 clips actions to Box bounds before env.step(), guaranteeing non-negative values
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(action_space,), dtype=np.float32)
+        
+        # Load or compute normalization statistics for observations (RC1)
+        # If normalization_stats provided (from training env), use them to prevent data leakage
+        if self._normalization_stats is not None:
+            self._macro_means = self._normalization_stats.get('macro_means')
+            self._macro_stds = self._normalization_stats.get('macro_stds')
+            self._tech_means = self._normalization_stats.get('tech_means', {})
+            self._tech_stds = self._normalization_stats.get('tech_stds', {})
+        else:
+            self._precompute_normalization_stats()
         
         # NEW: Observation space design
         if self.flatten_observations:
@@ -140,12 +155,18 @@ class StockPortfolioSequenceEnv(gym.Env):
         # Initialize portfolio weights - START WITH 100% CASH (0% allocation to all assets)
         if self.initial:
             self.current_weights = np.array([0.0] * self.stock_dim)
-        else: 
-        # extract weights from the last step (sequence length) of the previous state, 
-        # state is an array [sequence length, list of stock prices for len(daily_data.tic.unique()) 
-        # followed by weights for len(daily_data.tic.unique()) stocks and then followed by some indicators]
-            self.current_weights = np.array(self.previous_state[-1][self.stock_dim:2*self.stock_dim])
-            self.initial_amount = self.previous_state[-1][-1]
+        else:
+            # Restore state from previous walk-forward block
+            if isinstance(self.previous_state, dict):
+                # New format from get_terminal_state() — explicit and safe
+                self.current_weights = np.array(self.previous_state["current_weights"])
+                self.initial_amount = self.previous_state["portfolio_value"]
+            else:
+                # Legacy format: raw observation array
+                # Weights are at positions [stock_dim : 2*stock_dim] in each observation row
+                self.current_weights = np.array(self.previous_state[-1][self.stock_dim:2*self.stock_dim])
+                # NOTE: Do NOT extract initial_amount from observation[-1][-1] — that field
+                # is now relative_performance, not raw portfolio_value. Keep constructor default.
 
         self.portfolio_value = self.initial_amount
 
@@ -174,6 +195,42 @@ class StockPortfolioSequenceEnv(gym.Env):
         # NEW: Initialize log return memory for log_return reward
         self.log_return_memory = []
 
+    def _precompute_normalization_stats(self):
+        """Precompute normalization statistics from the training data for stable z-scoring."""
+        # Macro feature statistics
+        if self.macro_df is not None:
+            macro_vals = self.macro_df.iloc[:, 1:].values.astype(float)
+            self._macro_means = np.nanmean(macro_vals, axis=0)
+            self._macro_stds = np.nanstd(macro_vals, axis=0) + 1e-8
+        else:
+            self._macro_means = None
+            self._macro_stds = None
+        
+        # Technical indicator statistics (per indicator, across all stocks and dates)
+        self._tech_means = {}
+        self._tech_stds = {}
+        for tech in self.tech_indicator_list:
+            if tech in self.df.columns:
+                vals = self.df[tech].values.astype(float)
+                self._tech_means[tech] = np.nanmean(vals)
+                self._tech_stds[tech] = np.nanstd(vals) + 1e-8
+            else:
+                self._tech_means[tech] = 0.0
+                self._tech_stds[tech] = 1.0
+
+    def get_normalization_stats(self) -> dict:
+        """Export normalization stats so they can be passed to val/trade environments.
+        
+        Call this on the training environment, then pass the result as
+        normalization_stats= to validation and trade environments to prevent data leakage.
+        """
+        return {
+            'macro_means': self._macro_means,
+            'macro_stds': self._macro_stds,
+            'tech_means': dict(self._tech_means),
+            'tech_stds': dict(self._tech_stds),
+        }
+
     def _initialize_observation_buffer(self):
         """Initialize the observation buffer with historical data."""
         start_idx = max(0, self.day - self.sequence_length + 1)
@@ -198,103 +255,114 @@ class StockPortfolioSequenceEnv(gym.Env):
 
     def _build_daily_observation(self, daily_data, day_idx):
         """
-        Build observation for a single day following stock trading env pattern.
+        Build NORMALIZED observation for a single day (RC1: stationary, zero-mean features).
         
-        IMPROVED State Structure: [stock_prices, portfolio_weights, tech_indicators, returns?, volume?]
-        (Removed portfolio_value as it's not actionable)
+        State Structure: [log_returns, portfolio_weights, z-scored_tech_indicators,
+                          returns?, volume?, z-scored_macro_features, relative_performance]
+        
+        Key changes from original:
+        1. Log-returns instead of raw prices (stationary)
+        2. Z-score normalized technical indicators
+        3. Z-score normalized macro features
+        4. Relative portfolio performance instead of raw portfolio value
         
         Returns:
             np.array: 1D state vector for one timestep
         """
         state = []
         
-        # 1. Current stock prices (market state)
-        if len(daily_data.tic.unique()) > 1:
-            state.extend(daily_data.close.values.tolist())
+        # 1. LOG RETURNS instead of raw prices (stationary, ~zero mean)
+        if day_idx > 0:
+            prev_data = self.df.loc[day_idx - 1, :]
+            if len(daily_data.tic.unique()) > 1:
+                log_returns = np.log(daily_data.close.values / prev_data.close.values)
+                log_returns = np.clip(log_returns, -0.15, 0.15)
+                state.extend(log_returns.tolist())
+            else:
+                lr = np.log(daily_data.close.iloc[0] / prev_data.close.iloc[0])
+                state.append(float(np.clip(lr, -0.15, 0.15)))
         else:
-            state.append(daily_data.close.iloc[0])
+            state.extend([0.0] * self.stock_dim)
         
-        # 2. Current portfolio weights (allocation state)
+        # 2. Current portfolio weights (already 0-1, no normalization needed)
         state.extend(self.current_weights.tolist())
         
-        # 3. Technical indicators for all stocks (market sentiment/momentum)
+        # 3. Technical indicators — z-score normalized using precomputed stats
         for tech in self.tech_indicator_list:
             if len(daily_data.tic.unique()) > 1:
-                state.extend(daily_data[tech].values.tolist())
+                vals = daily_data[tech].values.astype(float)
             else:
-                state.append(daily_data[tech].iloc[0])
+                vals = np.array([float(daily_data[tech].iloc[0])])
+            
+            normalized = np.clip(
+                (vals - self._tech_means[tech]) / self._tech_stds[tech], -3.0, 3.0
+            )
+            state.extend(normalized.tolist())
 
-        # 4. Returns (if enabled) - market performance
+        # 4. Returns (if enabled) - clipped for stability
         if self.include_returns:
             if day_idx > 0:
                 prev_data = self.df.loc[day_idx - 1, :]
                 if len(daily_data.tic.unique()) > 1:
                     returns = (daily_data.close.values / prev_data.close.values) - 1
-                    state.extend(returns.tolist())
+                    state.extend(np.clip(returns, -0.15, 0.15).tolist())
                 else:
-                    returns = (daily_data.close.iloc[0] / prev_data.close.iloc[0]) - 1
-                    state.append(returns)
+                    r = (daily_data.close.iloc[0] / prev_data.close.iloc[0]) - 1
+                    state.append(float(np.clip(r, -0.15, 0.15)))
             else:
-                # First day: zero returns
-                if len(daily_data.tic.unique()) > 1:
-                    state.extend([0.0] * self.stock_dim)
-                else:
-                    state.append(0.0)
+                state.extend([0.0] * self.stock_dim)
 
-        # 5. Volume (if enabled and available) - market liquidity
+        # 5. Volume (if enabled) - log-normalized and z-scored
         if self.include_volume:
             if 'volume' in daily_data.columns:
                 if len(daily_data.tic.unique()) > 1:
-                    volumes = daily_data.volume.values
-                    # Normalize volume to prevent scale issues
-                    normalized_volumes = np.log(volumes + 1)
+                    volumes = daily_data.volume.values.astype(float)
+                    log_volumes = np.log(volumes + 1)
+                    mean_v = np.mean(log_volumes)
+                    std_v = np.std(log_volumes) + 1e-8
+                    normalized_volumes = np.clip((log_volumes - mean_v) / std_v, -3.0, 3.0)
                     state.extend(normalized_volumes.tolist())
                 else:
-                    volume = daily_data.volume.iloc[0]
-                    normalized_volume = np.log(volume + 1)
-                    state.append(normalized_volume)
+                    state.append(0.0)  # single stock, no cross-sectional normalization
             else:
-                # If volume not available, use zeros
-                if len(daily_data.tic.unique()) > 1:
-                    state.extend([0.0] * self.stock_dim)
-                else:
-                    state.append(0.0)
+                state.extend([0.0] * self.stock_dim if len(daily_data.tic.unique()) > 1 else [0.0])
 
-        # 6. Macro features (if available) - economic context
+        # 6. Macro features — z-score normalized using precomputed stats
         if self.macro_df is not None:
-            # Get the actual date from the current daily_data
             if len(daily_data.tic.unique()) > 1:
                 current_date = daily_data.date.unique()[0]
             else:
                 current_date = daily_data.date.iloc[0]
             
-            # Find matching row in macro_df by date
             macro_row = self.macro_df[self.macro_df['date'] == current_date]
             
             if len(macro_row) > 0:
-                # Found exact date match
-                macro_features = macro_row.iloc[0, 1:].values.flatten()  # skip date column
-                state.extend(macro_features.tolist())
+                macro_features = macro_row.iloc[0, 1:].values.flatten().astype(float)
             else:
-                # Fallback: find the most recent macro data before or on current_date
-                available_macro_dates = self.macro_df[self.macro_df['date'] <= current_date]
-                if len(available_macro_dates) > 0:
-                    # Use the most recent available macro data
-                    latest_macro_row = available_macro_dates.iloc[-1]
-                    macro_features = latest_macro_row.iloc[1:].values.flatten()  # skip date column
-                    state.extend(macro_features.tolist())
+                available = self.macro_df[self.macro_df['date'] <= current_date]
+                if len(available) > 0:
+                    macro_features = available.iloc[-1, 1:].values.flatten().astype(float)
                 else:
-                    # No historical macro data available - use zeros
-                    macro_feature_count = self.macro_df.shape[1] - 1  # subtract date column
-                    state.extend([0.0] * macro_feature_count)
+                    macro_features = np.zeros(self.macro_df.shape[1] - 1)
+            
+            # Z-score with precomputed statistics
+            normalized_macro = np.clip(
+                (macro_features - self._macro_means) / self._macro_stds, -3.0, 3.0
+            )
+            state.extend(normalized_macro.tolist())
 
-        # 7. current portfolio worth - has to be on the last place
-        state.append(self.portfolio_value)
+        # 7. Relative performance instead of raw portfolio value
+        # Normalized to ~[-0.5, 2.0] range — stationary and scale-independent
+        if self.initial_amount > 0:
+            rel_performance = (self.portfolio_value / self.initial_amount) - 1.0
+            state.append(float(np.clip(rel_performance, -0.5, 2.0)))
+        else:
+            state.append(0.0)
 
         if len(state) != self.state_dim:
-            print(f"ERROR: State dimension mismatch!")
+            print(f"ERROR: State dimension mismatch! Expected {self.state_dim}, got {len(state)}")
         
-        return np.array(state)
+        return np.array(state, dtype=np.float32)
     
     def _get_observation(self):
         """
@@ -414,10 +482,9 @@ class StockPortfolioSequenceEnv(gym.Env):
 
         else:
             # ================================================================
-            # STEP 1: Normalize softmax_normalization to get desired new portfolio weights
+            # STEP 1: Convert unbounded logits to portfolio weights via softmax (RC2)
             # ================================================================
-            total_weight = np.sum(actions)
-            new_weights = actions / total_weight
+            new_weights = self._softmax(actions)
             
             # Store old weights before updating
             old_weights = self.current_weights.copy()
@@ -549,6 +616,26 @@ class StockPortfolioSequenceEnv(gym.Env):
                 # Simple profit and loss
                 self.reward = gain
             
+            # ================================================================
+            # Active return reward (RC3): clear credit assignment vs 1/N
+            # ================================================================
+            if self.reward_type == "active_return":
+                # Equal-weight benchmark return
+                price_returns = (self.data.close.values / last_day_memory.close.values) - 1
+                benchmark_return = np.mean(price_returns)  # 1/N portfolio
+                
+                # Active return (excess over benchmark)
+                active_return = portfolio_return - benchmark_return
+                
+                # Turnover penalty: only for excessive rebalancing
+                turnover_penalty = 0.0
+                if turnover > 0.2:  # Raised from 0.1 — allow moderate rebalancing
+                    turnover_penalty = 0.001 * (turnover - 0.2)
+                
+                # No entropy bonus — PPO's ent_coef handles exploration.
+                # Entropy in reward causes convergence to 1/N (equal weights).
+                self.reward = (active_return * 1000) - turnover_penalty
+            
             assert not np.isnan(self.reward), "Reward contains NaN values"
             assert not np.isinf(self.reward), "Reward contains Inf values"
 
@@ -560,17 +647,20 @@ class StockPortfolioSequenceEnv(gym.Env):
         return observation, self.reward, self.terminal, False, {}
 
     def reset(self, *, seed=None, options=None):
-        """Reset environment with sequence buffer initialization."""
+        """Reset environment with sequence buffer initialization and optional random start (RC6)."""
         self.asset_memory = [self.initial_amount]
-        self.day = 0
         self.portfolio_value = self.initial_amount
         self.terminal = False
         self.portfolio_return_memory = [0]
 
         if self.initial:
             self.current_weights = np.array([0.0] * self.stock_dim)
-        else: 
-            self.current_weights = np.array(self.previous_state[-1][self.stock_dim:2*self.stock_dim])
+        else:
+            # Restore weights from previous walk-forward block
+            if isinstance(self.previous_state, dict):
+                self.current_weights = np.array(self.previous_state["current_weights"])
+            else:
+                self.current_weights = np.array(self.previous_state[-1][self.stock_dim:2*self.stock_dim])
 
         self.actions_memory = [self.current_weights.tolist()]
         
@@ -590,21 +680,55 @@ class StockPortfolioSequenceEnv(gym.Env):
         # Reset log return memory
         self.log_return_memory = []
         
+        # RC6: Random start position for training diversity
+        n_days = len(self.df.index.unique())
+        if self.random_start and n_days > self.sequence_length + 10:
+            # Start at a random point after enough history for the sequence buffer
+            max_start = n_days - self.sequence_length - 1
+            self.day = np.random.randint(self.sequence_length, max(self.sequence_length + 1, max_start))
+        else:
+            self.day = 0
+        
         # Initialize observation buffer
         self._initialize_observation_buffer()
         
         return self._get_observation(), {}
 
     def render(self, mode="human"):
-        """Render current state."""
+        """Render current state (returns observation; for walk-forward handoff use get_terminal_state())."""
         return self._get_observation()
 
+    def get_terminal_state(self) -> dict:
+        """Return terminal portfolio state for walk-forward handoff.
+        
+        This provides explicit portfolio_value and weights so the next
+        walk-forward block can initialize correctly without depending on
+        observation layout (which changed after normalization in RC1).
+        """
+        return {
+            "portfolio_value": self.portfolio_value,
+            "current_weights": self.current_weights.copy(),
+        }
+
+    def _softmax(self, actions):
+        """Normalize non-negative actions to portfolio weights that sum to 1.
+        
+        With action_space Box(0, 1), SB3 clips actions to [0, 1] before
+        env.step(). This gives a linear mapping from policy outputs to
+        portfolio weights — no exponential compression, no hyperparameters.
+        """
+        actions = np.asarray(actions, dtype=np.float64)
+        # Safety clip (actions should already be in [0,1] from SB3 clipping)
+        actions = np.clip(actions, 0.0, None)
+        total = actions.sum()
+        if total < 1e-8:
+            # All actions near zero → equal weight fallback
+            return np.ones_like(actions) / len(actions)
+        return actions / total
+
     def softmax_normalization(self, actions):
-        """Softmax normalization for portfolio weights."""
-        numerator = np.exp(actions)
-        denominator = np.sum(np.exp(actions))
-        softmax_output = numerator / denominator
-        return softmax_output
+        """Normalize portfolio weights (backward compat)."""
+        return self._softmax(actions)
 
     def save_asset_memory(self):
         """Save asset memory to DataFrame with transaction costs and turnover."""
@@ -641,11 +765,32 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
 
-    def get_sb_env(self):
-        """Get Stable-Baselines3 compatible environment."""
-        e = DummyVecEnv([lambda: self])
-        obs = e.reset()
-        return e, obs
+    def get_sb_env(self, n_envs=1):
+        """Get Stable-Baselines3 compatible environment.
+        
+        Args:
+            n_envs: Number of parallel environments. If > 1, uses SubprocVecEnv
+                    with random starts for training diversity (RC7).
+        """
+        if n_envs <= 1:
+            e = DummyVecEnv([lambda: self])
+            obs = e.reset()
+            return e, obs
+        else:
+            import copy
+            from stable_baselines3.common.vec_env import SubprocVecEnv
+            
+            def make_env_fn(seed_offset):
+                def _init():
+                    env = copy.deepcopy(self)
+                    env.random_start = True
+                    env._seed(seed_offset)
+                    return env
+                return _init
+            
+            e = SubprocVecEnv([make_env_fn(i) for i in range(n_envs)])
+            obs = e.reset()
+            return e, obs
 
     def validate_macro_alignment(self):
         """Validate that macro_df has perfect alignment with main df."""
