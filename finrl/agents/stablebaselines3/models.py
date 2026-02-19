@@ -1606,6 +1606,19 @@ class DRLAgent:
             trade_kwargs['random_start'] = False  # Deterministic evaluation for OOS trading
             trade_env_gym = env_constructor(trade_df, **trade_kwargs, initial=initial, previous_state=last_state)
             account_mem, actions_mem, last_state = self.DRL_prediction(best_policy, trade_env_gym, deterministic=True)
+
+            # Drop ghost row for continuation windows.
+            # When initial=False, reset() records the carried-over portfolio value
+            # and weights from the previous window before any trading occurs.
+            # The first step() then computes a return vs the same baseline day,
+            # producing a static duplicate at the window boundary. Drop it so
+            # consecutive windows stitch together without flat days.
+            if not initial:
+                if len(account_mem) > 1:
+                    account_mem = account_mem.iloc[1:].reset_index(drop=True)
+                if len(actions_mem) > 1:
+                    actions_mem = actions_mem.iloc[1:].reset_index(drop=True)
+
             initial = False
             # We can store these in lists for later analysis.
             # Example: store them as dataframes with iteration info
