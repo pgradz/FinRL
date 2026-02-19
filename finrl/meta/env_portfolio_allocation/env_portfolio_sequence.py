@@ -114,8 +114,8 @@ class StockPortfolioSequenceEnv(gym.Env):
         else:
             macro_features = 0
 
-        # Total state dimension:  prices + weights + tech_features * stocks + portfolio_value + macro_features
-        self.state_dim = self.stock_dim + self.stock_dim + (base_features_per_stock * self.stock_dim) + 1 + macro_features
+        # Total state dimension:  log_returns + weights + tech_features * stocks + macro_features
+        self.state_dim = self.stock_dim + self.stock_dim + (base_features_per_stock * self.stock_dim) + macro_features
 
         # Action space: [0, 1] per asset, normalized to portfolio weights in step()
         # SB3 clips actions to Box bounds before env.step(), guaranteeing non-negative values
@@ -258,7 +258,7 @@ class StockPortfolioSequenceEnv(gym.Env):
         Build NORMALIZED observation for a single day (RC1: stationary, zero-mean features).
         
         State Structure: [log_returns, portfolio_weights, z-scored_tech_indicators,
-                          returns?, volume?, z-scored_macro_features, relative_performance]
+                          z-scored_macro_features]
         
         Key changes from original:
         1. Log-returns instead of raw prices (stationary)
@@ -350,14 +350,6 @@ class StockPortfolioSequenceEnv(gym.Env):
                 (macro_features - self._macro_means) / self._macro_stds, -3.0, 3.0
             )
             state.extend(normalized_macro.tolist())
-
-        # 7. Relative performance instead of raw portfolio value
-        # Normalized to ~[-0.5, 2.0] range — stationary and scale-independent
-        if self.initial_amount > 0:
-            rel_performance = (self.portfolio_value / self.initial_amount) - 1.0
-            state.append(float(np.clip(rel_performance, -0.5, 2.0)))
-        else:
-            state.append(0.0)
 
         if len(state) != self.state_dim:
             print(f"ERROR: State dimension mismatch! Expected {self.state_dim}, got {len(state)}")
