@@ -11,6 +11,20 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 
 matplotlib.use("Agg")
 
+# Reward-type-specific initial variance defaults for EWMA normalization
+# These values are chosen to match typical empirical variance for each reward type:
+# - pnl/log_return: daily returns ~ O(10⁻³), variance ~ O(10⁻⁴) to O(10⁻⁶)
+# - active_return: excess returns ~ O(10⁻⁴), variance ~ O(10⁻⁵) to O(10⁻⁶)
+# - dsr: dimensionless ~ O(0.1-1), variance ~ O(0.01) to O(0.1)
+# - sharpe: dimensionless ~ O(0.1-2), variance ~ O(0.1) to O(1)
+REWARD_VAR_DEFAULTS = {
+    'pnl': 1e-4,
+    'log_return': 1e-4,
+    'active_return': 1e-5,
+    'dsr': 0.01,
+    'sharpe': 0.1
+}
+
 
 class StockPortfolioSequenceEnv(gym.Env):
     """
@@ -20,8 +34,13 @@ class StockPortfolioSequenceEnv(gym.Env):
     1. Maintains a rolling window of historical observations
     2. Observation space is 3D: (sequence_length, features, stocks) or flattened to 2D
     3. Supports both 2D and 1D observation formats for different models
-    4. Backward compatible with existing models via flatten_observations parameter
-    """
+    4. Backward compatible with existing models via flatten_observations parameter    
+    Reward Functions:
+    - pnl: Day-over-day portfolio percentage return (scale-invariant, includes TC)
+    - log_return: Per-step portfolio log return (adapted from Jiang et al., 2017 - arXiv:1706.10059)
+    - dsr: Differential Sharpe Ratio (Moody & Saffell, 2001)
+    - sharpe: Rolling Sharpe ratio (annualized)
+    - active_return: Excess return over equal-weight benchmark    """
 
     metadata = {"render.modes": ["human"]}
 
@@ -45,11 +64,19 @@ class StockPortfolioSequenceEnv(gym.Env):
         flatten_observations=False,  # NEW: Whether to flatten for MLP models
         include_returns=False,  # NEW: Include historical returns in observations
         include_volume=False,  # NEW: Include volume data,
-        dsr_eta: float = 0.1, # NEW: Update rate for Differential Sharpe Ratio
-        reward_type: str = "pnl",  # NEW: Reward function type: 'pnl', 'sharpe', 'dsr', 'log_return', or 'active_return'
-        log_return_window: int = 20,  # NEW: Window for averaging log returns
-        random_start: bool = False,  # NEW: Random episode start for training diversity
+        dsr_eta: float = 2.0 / 21,  # Moody & Saffell (2001) decay = 2/(T+1), T=20
+        reward_type: str = "pnl",  # Reward function type: 'pnl', 'sharpe', 'dsr', 'log_return', or 'active_return'
+        log_return_window: int = 20,  # Retained for memory tracking; no longer used for windowed averaging
+        sharpe_window: int = 21,  # Rolling window for Sharpe ratio (days). Keep ≈ state horizon for credit assignment
+        reward_transform: str = "ewma_zscore",  # Reward normalization: 'none' | 'ewma_zscore'
+        reward_beta: float = 0.05,  # EWMA update rate (0.05 ≈ 20-day halflife, balances responsiveness vs stability)
+        reward_clip: float = 3.0,  # Clip normalized rewards to ±3 std (keeps 99.7% of normal distribution)
+        reward_stats: dict = None,  # Optional precomputed reward stats from training env
+        update_reward_stats: bool = True,  # If False, use fixed reward_stats without updating
+        random_start: bool = False,  # Random episode start for training diversity
         normalization_stats: dict = None,  # Pre-computed stats from training env (prevents data leakage)
+        turnover_penalty_threshold: float = 0.20,  # Penalty-free daily turnover (~10% reallocation)
+        turnover_penalty_coeff: float = 0.0,  # Set to 0.0 to disable (default); use >0 to penalize excessive turnover
         model_name="",
         mode="",
         iteration="",
@@ -67,6 +94,18 @@ class StockPortfolioSequenceEnv(gym.Env):
             flatten_observations: If True, flatten to 1D for MLP models. If False, keep 2D for sequence models
             include_returns: Whether to include historical returns
             include_volume: Whether to include volume information
+            dsr_eta: Learning rate for Differential Sharpe Ratio (Moody & Saffell, 2001)
+            reward_type: Type of reward function ('pnl', 'dsr', 'sharpe', 'log_return', 'active_return')
+            log_return_window: Window for averaging log returns
+            reward_transform: Normalization strategy ('none' or 'ewma_zscore')
+            reward_beta: EWMA update rate for reward normalization
+            reward_clip: Clipping range for normalized rewards (in std devs)
+            reward_stats: Pre-computed reward stats from training env (prevents data leakage)
+            update_reward_stats: Whether to update reward stats online
+            random_start: Random episode start for training diversity
+            normalization_stats: Pre-computed normalization stats from training
+            turnover_penalty_threshold: Turnover threshold before penalty applies (default: 0.20)
+            turnover_penalty_coeff: Penalty coefficient (default: 0.0 = disabled)
         """
         self.day = day
         self.lookback = lookback
@@ -90,8 +129,26 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.reward_type = reward_type
         self.dsr_eta = dsr_eta
         self.log_return_window = log_return_window
+        self.sharpe_window = sharpe_window
+        self.reward_transform = reward_transform
+        self.reward_beta = reward_beta
+        self.reward_clip = reward_clip
+        self.update_reward_stats = update_reward_stats
         self.random_start = random_start
+        self.turnover_penalty_threshold = turnover_penalty_threshold
+        self.turnover_penalty_coeff = turnover_penalty_coeff
         self._normalization_stats = normalization_stats  # externally provided stats
+
+        # Reward normalization state (shared transform layer across reward types)
+        # Initial variance is reward-type-specific to avoid scale mismatches:
+        # - pnl/log_return use 1e-4 (typical daily return variance)
+        # - dsr/sharpe use larger values (0.01-0.1) to match their O(0.1-1) scale
+        if reward_stats is None:
+            self._reward_mean = 0.0
+            self._reward_var = REWARD_VAR_DEFAULTS.get(reward_type, 1e-4)
+        else:
+            self._reward_mean = float(reward_stats.get("mean", 0.0))
+            self._reward_var = float(reward_stats.get("var", 1e-4))
 
         # for muliple runs
         self.model_name = model_name
@@ -175,6 +232,8 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.portfolio_return_memory = [0]
         self.actions_memory = [self.current_weights.tolist()]
         self.date_memory = []
+        self.raw_reward_memory = []
+        self.scaled_reward_memory = []
         
         # NEW: Track transaction costs and turnover
         self.transaction_cost_memory = []
@@ -190,10 +249,12 @@ class StockPortfolioSequenceEnv(gym.Env):
         # NEW: Initialize state for Differential Sharpe Ratio
         self.dsr_a = 0.0
         self.dsr_b = 0.0
-        self.last_sharpe = 0.0
         
-        # NEW: Initialize log return memory for log_return reward
+        # Initialize log return memory for log_return reward
         self.log_return_memory = []
+
+        # Initialize reward value
+        self.reward = 0.0
 
     def _precompute_normalization_stats(self):
         """Precompute normalization statistics from the training data for stable z-scoring."""
@@ -230,6 +291,67 @@ class StockPortfolioSequenceEnv(gym.Env):
             'tech_means': dict(self._tech_means),
             'tech_stds': dict(self._tech_stds),
         }
+
+    def get_reward_stats(self) -> dict:
+        """Export reward normalization stats for val/trade environments."""
+        return {
+            "mean": float(self._reward_mean),
+            "var": float(self._reward_var),
+        }
+
+    def _transform_reward(self, raw_reward: float) -> float:
+        """Apply optional reward normalization and global scaling.
+        
+        Purpose: Bring different reward types (return, Sharpe, DSR, log returns) to
+        similar scale for stable policy gradient learning.
+        
+        Pipeline:
+            raw_reward -> (optional EWMA z-score + clipping) -> reward_scaling
+        
+        Hyperparameter Guidance:
+        ------------------------
+        reward_beta (EWMA update rate):
+            - 0.01 = ~100 day halflife (very smooth, slow adaptation)
+            - 0.05 = ~20 day halflife (balanced, RECOMMENDED)
+            - 0.10 = ~10 day halflife (responsive, may overfit to recent data)
+        
+        reward_clip (std deviations):
+            - 2.0 = keeps 95% of normal distribution (aggressive clipping)
+            - 3.0 = keeps 99.7% of normal distribution (RECOMMENDED)
+            - 5.0 = keeps 99.9994% (minimal clipping)
+        
+        For minimal ablation: test {beta=0.05, clip=3.0} vs {transform='none'}
+        """
+        raw_reward = float(raw_reward)
+
+        if self.reward_transform == "none":
+            return raw_reward * self.reward_scaling
+
+        if self.reward_transform != "ewma_zscore":
+            raise ValueError(f"Unknown reward_transform: {self.reward_transform}")
+
+        # Capture mean BEFORE update for consistent z-scoring.
+        # δ is computed against the old mean, so the z-score must also
+        # centre on the old mean; using the *updated* mean would shrink
+        # every z-score by a factor of (1-β) ≈ 0.95.
+        centering_mean = self._reward_mean
+
+        if self.update_reward_stats:
+            beta = self.reward_beta
+            delta = raw_reward - self._reward_mean
+            self._reward_mean = (1 - beta) * self._reward_mean + beta * raw_reward
+            # Standard EWMA variance update:
+            #   var_t = (1-β) * var_{t-1} + β * δ²
+            # where δ = x_t - μ_{t-1} (deviation from OLD mean).
+            # This is the conventional exponentially weighted moving average of
+            # squared deviations, ensuring numerical stability and consistency
+            # with the mean update.
+            self._reward_var = (1 - beta) * self._reward_var + beta * (delta ** 2)
+
+        reward_std = np.sqrt(max(self._reward_var, 1e-8))
+        normalized_reward = (raw_reward - centering_mean) / reward_std
+        normalized_reward = float(np.clip(normalized_reward, -self.reward_clip, self.reward_clip))
+        return normalized_reward * self.reward_scaling
 
     def _initialize_observation_buffer(self):
         """Initialize the observation buffer with historical data."""
@@ -541,92 +663,197 @@ class StockPortfolioSequenceEnv(gym.Env):
             self.asset_memory.append(new_portfolio_value)
 
             # ================================================================
-            # STEP 5: Calculate reward based on reward_type
+            # STEP 5: Calculate raw reward metric based on reward_type
             # ================================================================
+            # Reward scaling is applied through a shared transform layer
+            # (EWMA z-score + clipping + reward_scaling) for all reward types.
+            # ================================================================
+            
+            # Optional turnover penalty (raw-reward space)
+            # Keep in the same unit space as raw_reward, then normalize once.
+            turnover_penalty = 0.0
+            if turnover > self.turnover_penalty_threshold:
+                turnover_penalty = self.turnover_penalty_coeff * (turnover - self.turnover_penalty_threshold)
+            
             if self.reward_type == "log_return":
-                # Logarithmic return reward - Kelly optimal for long-term growth
+                # Per-step portfolio log return adapted from Jiang et al. (2017,
+                # arXiv:1706.10059, Eq. 11).
+                #
+                # Original (batch):  R = (1/T) Σ_t ln(μ_t · y_t · w_{t-1})
+                #   y_t  = price relative vector  (close_t / close_{t-1})
+                #   w    = portfolio weight vector chosen at end of t-1
+                #   μ_t  = transaction remainder factor ≈ 1 - c_p · turnover
+                #
+                # Adaptation for online (step-by-step) RL:
+                #   - Emit the per-step log return  ln(μ_t · y_t · w_{t-1})
+                #     as the immediate reward.  Maximising the discounted sum
+                #     of per-step log returns is equivalent to maximising the
+                #     log of terminal wealth (Kelly/growth-optimal criterion).
+                #   - Variance reduction is delegated to _transform_reward
+                #     (EWMA z-score) and PPO's GAE, rather than averaging
+                #     over a rolling window which dilutes credit assignment.
+                #
+                # Caveat vs. original paper:
+                #   Jiang et al. optimise the *episode-level* sum with a
+                #   deterministic policy gradient (EIIE).  Here we emit
+                #   per-step rewards for compatibility with SB3's online
+                #   algorithms (PPO, DDPG, etc.).  The objective is
+                #   mathematically equivalent when γ = 1, but in practice
+                #   γ < 1 down-weights distant future returns.
                 if len(self.asset_memory) > 1:
-                    # Current log return
-                    current_log_return = np.log(self.asset_memory[-1] / self.asset_memory[-2])
+                    # Per-step log return: ln(V_t / V_{t-1})
+                    # Computed directly from portfolio value ratio, which
+                    # already incorporates TC (subtracted in Step 2).
+                    # This is numerically identical to the decomposed form
+                    #   ln(μ_t · dot(y_t, w))  where μ_t = 1 - c·turnover
+                    # but avoids any floating-point divergence between paths
+                    # and eliminates the appearance of double-counting TC.
+                    ratio = self.asset_memory[-1] / (self.asset_memory[-2] + 1e-10)
+                    raw_reward = np.log(max(ratio, 1e-10))  # Guard against log(0) or log(negative)
                     
-                    # Store for averaging
-                    self.log_return_memory.append(current_log_return)
-                    
-                    # Average over window (smooths noise, encourages consistent growth)
-                    if len(self.log_return_memory) >= self.log_return_window:
-                        # Use exponential moving average for recent bias
-                        weights = np.exp(np.linspace(-1, 0, len(self.log_return_memory[-self.log_return_window:])))
-                        weights = weights / weights.sum()
-                        avg_log_return = np.average(
-                            self.log_return_memory[-self.log_return_window:],
-                            weights=weights
-                        )
-                        self.reward = avg_log_return
-                    else:
-                        # Not enough history yet - use simple average
-                        self.reward = np.mean(self.log_return_memory)
-                    
-                    # Scale up for better gradient magnitude
-                    self.reward *= 100  # Convert to percentage-like scale
+                    self.log_return_memory.append(raw_reward)
                 else:
-                    self.reward = 0.0
+                    raw_reward = 0.0
             
             elif self.reward_type == "dsr":
-                # Differential Sharpe Ratio - rewards improvements in Sharpe ratio
+                # Differential Sharpe Ratio — Moody & Saffell (2001), Eq. 9:
+                #   DSR_t = (B_{t-1} · ΔA_t  -  0.5 · A_{t-1} · ΔB_t)
+                #           / (B_{t-1} - A_{t-1}²)^{3/2}
+                #
+                # A_t = EMA of returns,  B_t = EMA of squared returns.
+                # The formula uses the PREVIOUS moments (t-1) because DSR is
+                # the derivative of the Sharpe ratio w.r.t. the new return,
+                # evaluated at the state *before* observing R_t.
                 if len(self.asset_memory) > 1:
-                    current_return = (self.asset_memory[-1] / self.asset_memory[-2]) - 1
+                    current_return = (self.asset_memory[-1] / (self.asset_memory[-2] + 1e-10)) - 1
                     
-                    # Update running moments (exponential moving average)
-                    self.dsr_a = (1 - self.dsr_eta) * self.dsr_a + self.dsr_eta * current_return
-                    self.dsr_b = (1 - self.dsr_eta) * self.dsr_b + self.dsr_eta * (current_return ** 2)
+                    prev_a = self.dsr_a
+                    prev_b = self.dsr_b
                     
-                    # Calculate current Sharpe and the differential reward
-                    current_std = (self.dsr_b - self.dsr_a**2)**0.5
-                    if current_std != 0:
-                        current_sharpe = self.dsr_a / current_std
-                        self.reward = current_sharpe - self.last_sharpe
-                        self.last_sharpe = current_sharpe
+                    # Update exponential moving averages
+                    self.dsr_a = (1 - self.dsr_eta) * prev_a + self.dsr_eta * current_return
+                    self.dsr_b = (1 - self.dsr_eta) * prev_b + self.dsr_eta * (current_return ** 2)
+                    
+                    # Calculate deltas
+                    delta_a = self.dsr_a - prev_a  # = eta * (R_t - prev_a)
+                    delta_b = self.dsr_b - prev_b  # = eta * (R_t² - prev_b)
+                    
+                    # Variance from PREVIOUS moments (Moody & Saffell 2001, Eq. 9)
+                    variance = prev_b - prev_a ** 2
+                    
+                    if variance > 1e-12:
+                        dsr = (prev_b * delta_a - 0.5 * prev_a * delta_b) / (variance ** 1.5)
+                        raw_reward = dsr
                     else:
-                        self.reward = 0.0
+                        # Warmup: variance not yet reliable. Emit 0 to avoid scale
+                        # discontinuity (DSR ~ O(0.1-1) vs current_return ~ O(10⁻³)).
+                        # The EWMA normalization will handle the warmup period gracefully.
+                        raw_reward = 0.0
                 else:
-                    self.reward = 0.0
+                    raw_reward = 0.0
+            
+            elif self.reward_type == "active_return":
+                # Excess return over equal-weight benchmark
+                # 
+                # Benchmark Strategy: 1/N equal-weight allocation
+                # Default: Benchmark is GROSS (no TC), Agent is NET (includes TC)
+                # Rationale: Equal-weight indices typically rebalance infrequently
+                # (monthly/quarterly), so daily TC is negligible. This follows
+                # industry standard for evaluating active management.
+                # 
+                # For symmetric comparison, benchmark TC can be calculated as:
+                # Equal-weight drift due to price changes causes weight deviations,
+                # rebalancing back to 1/N incurs turnover costs.
+                price_returns = (self.data.close.values / np.maximum(last_day_memory.close.values, 1e-10)) - 1
+                benchmark_gross_return = np.mean(price_returns)
+                
+                # Optional: Calculate benchmark transaction costs if rebalancing to equal weights
+                # Uncomment below to include benchmark TC for symmetric comparison:
+                # if len(self.asset_memory) > 1:
+                #     # After price changes, weights drift from equal-weight
+                #     benchmark_weights_after_drift = np.ones(self.stock_dim) / self.stock_dim
+                #     benchmark_weights_after_drift *= (1 + price_returns)
+                #     benchmark_weights_after_drift /= benchmark_weights_after_drift.sum()
+                #     # Turnover to rebalance back to equal weights
+                #     target_weights = np.ones(self.stock_dim) / self.stock_dim
+                #     benchmark_turnover = np.sum(np.abs(target_weights - benchmark_weights_after_drift))
+                #     benchmark_tc = benchmark_turnover * self.transaction_cost_pct
+                #     benchmark_net_return = benchmark_gross_return - benchmark_tc
+                # else:
+                #     benchmark_net_return = benchmark_gross_return
+                
+                # Use agent NET return (TC already applied to portfolio_value)
+                agent_return = (self.asset_memory[-1] / (self.asset_memory[-2] + 1e-10)) - 1
+                
+                # Active return: Agent NET vs Benchmark GROSS (default, conservative)
+                active_return = agent_return - benchmark_gross_return
+                # Alternatively, for symmetric comparison: agent_return - benchmark_net_return
+                
+                raw_reward = active_return
             
             elif self.reward_type == "sharpe":
-                # Rolling Sharpe ratio
-                if len(self.portfolio_return_memory) >= 20:
-                    recent_returns = self.portfolio_return_memory[-20:]
-                    mean_return = np.mean(recent_returns)
-                    std_return = np.std(recent_returns)
-                    if std_return != 0:
-                        self.reward = (mean_return / std_return) * np.sqrt(252)
+                # Rolling Sharpe ratio using NET returns (TC-adjusted)
+                #
+                # Window size (sharpe_window, default 21 ≈ 1 month):
+                #   - Balances statistical reliability vs. credit assignment
+                #   - Current action contributes ~1/window to the signal
+                #   - Consider DSR for sharper per-step credit assignment
+                #
+                # Design choices:
+                #   - ddof=1 for unbiased std estimate on small windows
+                #   - No √252 annualization: _transform_reward handles scaling;
+                #     annualisation inflates magnitude without adding info
+                #   - Warmup emits 0 to avoid scale discontinuity (warmup
+                #     net-return ≈ O(0.001) vs Sharpe ≈ O(0.5–2) is a ~1000×
+                #     jump that destabilises the EWMA normaliser)
+                if len(self.asset_memory) >= self.sharpe_window:
+                    recent_values = self.asset_memory[-self.sharpe_window:]
+                    recent_net_returns = [
+                        recent_values[i] / (recent_values[i - 1] + 1e-10) - 1
+                        for i in range(1, len(recent_values))
+                    ]
+                    mean_return = np.mean(recent_net_returns)
+                    std_return = np.std(recent_net_returns, ddof=1)
+                    if std_return > 1e-12:
+                        raw_reward = mean_return / std_return
                     else:
-                        self.reward = 0.0
+                        raw_reward = 0.0
                 else:
-                    self.reward = portfolio_return
+                    # Warmup: not enough history for reliable Sharpe estimate.
+                    # Use None to signal that normalization should be skipped
+                    # (avoids corrupting EWMA stats with zeros during warmup).
+                    raw_reward = None
             
-            else:  # "pnl" or default
-                # Simple profit and loss
-                self.reward = gain
+            elif self.reward_type == "pnl":
+                # Day-over-day portfolio percentage return (scale-invariant,
+                # includes TC drag via portfolio_value adjustment in step 2).
+                # NOTE: Named 'pnl' for backward compatibility; the actual
+                # quantity is (V_t / V_{t-1}) - 1, not dollar PnL.
+                if len(self.asset_memory) > 1:
+                    raw_reward = (self.asset_memory[-1] / (self.asset_memory[-2] + 1e-10)) - 1
+                else:
+                    raw_reward = 0.0
             
-            # ================================================================
-            # Active return reward (RC3): clear credit assignment vs 1/N
-            # ================================================================
-            if self.reward_type == "active_return":
-                # Equal-weight benchmark return
-                price_returns = (self.data.close.values / last_day_memory.close.values) - 1
-                benchmark_return = np.mean(price_returns)  # 1/N portfolio
-                
-                # Active return (excess over benchmark)
-                active_return = portfolio_return - benchmark_return
-                
-                # Turnover penalty: only for excessive rebalancing
-                turnover_penalty = 0.0
-                if turnover > 0.2:  # Raised from 0.1 — allow moderate rebalancing
-                    turnover_penalty = 0.001 * (turnover - 0.2)
-                
-                # No entropy bonus — PPO's ent_coef handles exploration.
-                # Entropy in reward causes convergence to 1/N (equal weights).
-                self.reward = (active_return * 1000) - turnover_penalty
+            else:
+                raise ValueError(f"Unknown reward_type: {self.reward_type}")
+
+            # Handle turnover penalty and reward transformation
+            # Special case: Sharpe warmup returns None to skip normalization
+            if raw_reward is None:
+                # Warmup period for Sharpe — not enough history for reliable estimate.
+                # Emit 0 reward: avoids corrupting EWMA stats (which would adapt to
+                # return-scale ~10⁻³, then face ~1000× scale jump when real Sharpe
+                # values ~O(1) begin flowing). Cost: agent learns nothing for ~21
+                # steps per episode (negligible for multi-year episodes).
+                self.reward = 0.0
+                self.raw_reward_memory.append(0.0)
+                self.scaled_reward_memory.append(0.0)
+            else:
+                raw_reward = raw_reward - turnover_penalty
+                transformed_reward = self._transform_reward(raw_reward)
+                self.reward = transformed_reward
+                self.raw_reward_memory.append(float(raw_reward))
+                self.scaled_reward_memory.append(float(self.reward))
             
             assert not np.isnan(self.reward), "Reward contains NaN values"
             assert not np.isinf(self.reward), "Reward contains Inf values"
@@ -655,6 +882,8 @@ class StockPortfolioSequenceEnv(gym.Env):
                 self.current_weights = np.array(self.previous_state[-1][self.stock_dim:2*self.stock_dim])
 
         self.actions_memory = [self.current_weights.tolist()]
+        self.raw_reward_memory = []
+        self.scaled_reward_memory = []
         
         self.date_memory = []
         self.observation_buffer = []
@@ -667,7 +896,6 @@ class StockPortfolioSequenceEnv(gym.Env):
         # Reset DSR states
         self.dsr_a = 0.0
         self.dsr_b = 0.0
-        self.last_sharpe = 0.0
         
         # Reset log return memory
         self.log_return_memory = []
