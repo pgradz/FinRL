@@ -75,6 +75,7 @@ class StockPortfolioSequenceEnv(gym.Env):
         update_reward_stats: bool = True,  # If False, use fixed reward_stats without updating
         random_start: bool = False,  # Random episode start for training diversity
         normalization_stats: dict = None,  # Pre-computed stats from training env (prevents data leakage)
+        rebalancing_threshold: float = 0.0,  # Minimum turnover required to execute rebalancing (default: 0.0 = always rebalance)
         turnover_penalty_threshold: float = 0.20,  # Penalty-free daily turnover (~10% reallocation)
         turnover_penalty_coeff: float = 0.0,  # Set to 0.0 to disable (default); use >0 to penalize excessive turnover
         model_name="",
@@ -104,6 +105,7 @@ class StockPortfolioSequenceEnv(gym.Env):
             update_reward_stats: Whether to update reward stats online
             random_start: Random episode start for training diversity
             normalization_stats: Pre-computed normalization stats from training
+            rebalancing_threshold: Minimum turnover required to execute rebalancing (default: 0.0 = always rebalance)
             turnover_penalty_threshold: Turnover threshold before penalty applies (default: 0.20)
             turnover_penalty_coeff: Penalty coefficient (default: 0.0 = disabled)
         """
@@ -135,6 +137,7 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.reward_clip = reward_clip
         self.update_reward_stats = update_reward_stats
         self.random_start = random_start
+        self.rebalancing_threshold = rebalancing_threshold
         self.turnover_penalty_threshold = turnover_penalty_threshold
         self.turnover_penalty_coeff = turnover_penalty_coeff
         self._normalization_stats = normalization_stats  # externally provided stats
@@ -604,26 +607,34 @@ class StockPortfolioSequenceEnv(gym.Env):
             old_weights = self.current_weights.copy()
             
             # ================================================================
-            # STEP 2: Calculate transaction costs for rebalancing
+            # STEP 2: Rebalancing Threshold Check (Execution Layer)
             # ================================================================
-            # Turnover is the sum of absolute weight changes
+            # Calculate turnover BEFORE deciding whether to rebalance
             # This represents the fraction of portfolio that needs to be traded
             turnover = np.sum(np.abs(new_weights - old_weights))
             
-            # Transaction cost as a percentage of the traded amount
-            # If turnover = 0.5 (50% of portfolio traded) and cost_pct = 0.001 (0.1%)
-            # Then total cost = 0.5 * 0.001 * portfolio_value = 0.0005 * portfolio_value
-            transaction_cost = turnover * self.transaction_cost_pct * self.portfolio_value
-            
-            # Apply transaction cost BEFORE calculating returns
-            # This is the correct sequence: pay to rebalance, then earn returns
-            self.portfolio_value -= transaction_cost
+            # Check if turnover exceeds threshold - if not, skip rebalancing entirely
+            if turnover < self.rebalancing_threshold:
+                # Skip rebalancing: keep old weights, pay no transaction costs
+                new_weights = old_weights.copy()
+                turnover = 0.0
+                transaction_cost = 0.0
+            else:
+                # Execute rebalancing: calculate and pay transaction costs
+                # Transaction cost as a percentage of the traded amount
+                # If turnover = 0.5 (50% of portfolio traded) and cost_pct = 0.001 (0.1%)
+                # Then total cost = 0.5 * 0.001 * portfolio_value = 0.0005 * portfolio_value
+                transaction_cost = turnover * self.transaction_cost_pct * self.portfolio_value
+                
+                # Apply transaction cost BEFORE calculating returns
+                # This is the correct sequence: pay to rebalance, then earn returns
+                self.portfolio_value -= transaction_cost
             
             # Track costs and turnover for analysis
             self.transaction_cost_memory.append(transaction_cost)
             self.turnover_memory.append(turnover)
             
-            # Update current weights AFTER paying transaction costs
+            # Update current weights
             self.current_weights = new_weights
             self.actions_memory.append(new_weights)
             

@@ -1617,7 +1617,8 @@ class DRLAgent:
                 if len(account_mem) > 1:
                     account_mem = account_mem.iloc[1:].reset_index(drop=True)
                 if len(actions_mem) > 1:
-                    actions_mem = actions_mem.iloc[1:].reset_index(drop=True)
+                    # Keep the date index, don't reset to integers
+                    actions_mem = actions_mem.iloc[1:]
 
             initial = False
             # We can store these in lists for later analysis.
