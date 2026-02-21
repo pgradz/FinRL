@@ -78,6 +78,7 @@ class StockPortfolioSequenceEnv(gym.Env):
         rebalancing_threshold: float = 0.0,  # Minimum turnover required to execute rebalancing (default: 0.0 = always rebalance)
         turnover_penalty_threshold: float = 0.20,  # Penalty-free daily turnover (~10% reallocation)
         turnover_penalty_coeff: float = 0.0,  # Set to 0.0 to disable (default); use >0 to penalize excessive turnover
+        action_mode: str = "absolute",  # "absolute" = target weights, "residual" = weight deltas (zero action = hold)
         model_name="",
         mode="",
         iteration="",
@@ -140,6 +141,7 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.rebalancing_threshold = rebalancing_threshold
         self.turnover_penalty_threshold = turnover_penalty_threshold
         self.turnover_penalty_coeff = turnover_penalty_coeff
+        self.action_mode = action_mode
         self._normalization_stats = normalization_stats  # externally provided stats
 
         # Reward normalization state (shared transform layer across reward types)
@@ -177,9 +179,16 @@ class StockPortfolioSequenceEnv(gym.Env):
         # Total state dimension:  log_returns + weights + tech_features * stocks + macro_features
         self.state_dim = self.stock_dim + self.stock_dim + (base_features_per_stock * self.stock_dim) + macro_features
 
-        # Action space: [0, 1] per asset, normalized to portfolio weights in step()
-        # SB3 clips actions to Box bounds before env.step(), guaranteeing non-negative values
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(action_space,), dtype=np.float32)
+        # Action space definition depends on action_mode:
+        # - "absolute": Box(0, 1) — actions are target portfolio weights (SB3 clips to non-negative)
+        # - "residual": Box(-1, 1) — actions are weight DELTAS from current allocation
+        #   Zero action = hold current portfolio = zero turnover = zero TC
+        #   This aligns NN zero-initialization with the optimal default (hold),
+        #   so the agent must actively push outputs away from zero to trade.
+        if self.action_mode == "residual":
+            self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(action_space,), dtype=np.float32)
+        else:
+            self.action_space = spaces.Box(low=0.0, high=1.0, shape=(action_space,), dtype=np.float32)
         
         # Load or compute normalization statistics for observations (RC1)
         # If normalization_stats provided (from training env), use them to prevent data leakage
@@ -538,7 +547,9 @@ class StockPortfolioSequenceEnv(gym.Env):
         """
         self.terminal = self.day >= len(self.df.index.unique()) - 1
 
-        if np.all(actions == 0):
+        if self.action_mode != "residual" and np.all(actions == 0):
+            # In absolute mode, all-zero actions are degenerate (no allocation preference).
+            # In residual mode, all-zero actions mean "hold" — the desired default.
             print("Warning: Actions are all zeros, assigning equal weights.")
             actions = np.array([1.0 / len(actions)] * len(actions))
 
@@ -599,9 +610,17 @@ class StockPortfolioSequenceEnv(gym.Env):
 
         else:
             # ================================================================
-            # STEP 1: Convert unbounded logits to portfolio weights via softmax (RC2)
+            # STEP 1: Convert actions to portfolio weights
             # ================================================================
-            new_weights = self._softmax(actions)
+            if self.action_mode == "residual":
+                # Residual: actions are weight deltas from current allocation.
+                # Zero action = hold current weights = zero turnover = zero TC.
+                # This aligns the NN's zero-initialization with the financially
+                # optimal default (hold), so the agent must actively push to trade.
+                proposed_weights = self.current_weights + actions
+                new_weights = self._softmax(proposed_weights)
+            else:
+                new_weights = self._softmax(actions)
             
             # Store old weights before updating
             old_weights = self.current_weights.copy()
@@ -679,6 +698,26 @@ class StockPortfolioSequenceEnv(gym.Env):
             # Reward scaling is applied through a shared transform layer
             # (EWMA z-score + clipping + reward_scaling) for all reward types.
             # ================================================================
+            
+            # EXPLICIT Transaction Cost Penalty (visible to policy)
+            # TC is already subtracted from portfolio_value (financial correctness),
+            # but we add it as an explicit penalty so the policy can learn the
+            # DIRECT connection between its actions and costs.
+            # 
+            # Scale TC penalty to achieve ~10% EXPLICIT impact across reward types.
+            # Return-based rewards already carry ~100-200% IMPLICIT TC (via V_t
+            # reduction), so they need small explicit multipliers (0.05-0.1).
+            # DSR/Sharpe have negligible implicit TC (<1%), so need large
+            # multipliers (15-100x) to make TC visible in the gradient.
+            TC_PENALTY_SCALES = {
+                'log_return': 0.1,    # Implicit TC already ~100% of signal; 0.1 adds ~10% explicit
+                'pnl': 0.1,           # Same as log_return
+                'active_return': 0.05, # Implicit TC already ~200% of signal (agent NET vs bench GROSS); 0.05 adds ~10%
+                'dsr': 15.0,          # DSR typical scale ~0.15 vs TC ~0.001; 15x → ~10% explicit
+                'sharpe': 100.0,      # Sharpe typical scale ~1.0 vs TC ~0.001; 100x → ~10% explicit
+            }
+            tc_scale = TC_PENALTY_SCALES.get(self.reward_type, 1.0)
+            explicit_tc_penalty = (transaction_cost / self.initial_amount) * tc_scale
             
             # Optional turnover penalty (raw-reward space)
             # Keep in the same unit space as raw_reward, then normalize once.
@@ -848,7 +887,7 @@ class StockPortfolioSequenceEnv(gym.Env):
             else:
                 raise ValueError(f"Unknown reward_type: {self.reward_type}")
 
-            # Handle turnover penalty and reward transformation
+            # Handle explicit TC penalty, turnover penalty, and reward transformation
             # Special case: Sharpe warmup returns None to skip normalization
             if raw_reward is None:
                 # Warmup period for Sharpe — not enough history for reliable estimate.
@@ -860,7 +899,8 @@ class StockPortfolioSequenceEnv(gym.Env):
                 self.raw_reward_memory.append(0.0)
                 self.scaled_reward_memory.append(0.0)
             else:
-                raw_reward = raw_reward - turnover_penalty
+                # Apply penalties BEFORE transformation so they get normalized together
+                raw_reward = raw_reward - explicit_tc_penalty - turnover_penalty
                 transformed_reward = self._transform_reward(raw_reward)
                 self.reward = transformed_reward
                 self.raw_reward_memory.append(float(raw_reward))
@@ -942,11 +982,11 @@ class StockPortfolioSequenceEnv(gym.Env):
         }
 
     def _softmax(self, actions):
-        """Normalize non-negative actions to portfolio weights that sum to 1.
+        """Project a vector onto the probability simplex (non-negative, sum=1).
         
-        With action_space Box(0, 1), SB3 clips actions to [0, 1] before
-        env.step(). This gives a linear mapping from policy outputs to
-        portfolio weights — no exponential compression, no hyperparameters.
+        In absolute mode: input is raw actions from Box(0,1).
+        In residual mode: input is (current_weights + deltas), which may
+        contain negative entries — these are clipped to 0 before normalizing.
         """
         actions = np.asarray(actions, dtype=np.float64)
         # Safety clip (actions should already be in [0,1] from SB3 clipping)
