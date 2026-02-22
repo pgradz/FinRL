@@ -79,6 +79,8 @@ class StockPortfolioSequenceEnv(gym.Env):
         turnover_penalty_threshold: float = 0.20,  # Penalty-free daily turnover (~10% reallocation)
         turnover_penalty_coeff: float = 0.0,  # Set to 0.0 to disable (default); use >0 to penalize excessive turnover
         action_mode: str = "absolute",  # "absolute" = target weights, "residual" = weight deltas (zero action = hold)
+        decision_interval: int = 1,  # Act every N trading days (1=daily, 5=weekly). Hold days advance prices but skip action/TC.
+        randomize_interval_offset: bool = False,  # Training: randomize phase so agent doesn't overfit to a fixed weekday
         model_name="",
         mode="",
         iteration="",
@@ -142,6 +144,8 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.turnover_penalty_threshold = turnover_penalty_threshold
         self.turnover_penalty_coeff = turnover_penalty_coeff
         self.action_mode = action_mode
+        self.decision_interval = max(1, int(decision_interval))
+        self.randomize_interval_offset = randomize_interval_offset
         self._normalization_stats = normalization_stats  # externally provided stats
 
         # Reward normalization state (shared transform layer across reward types)
@@ -246,6 +250,10 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.date_memory = []
         self.raw_reward_memory = []
         self.scaled_reward_memory = []
+        
+        # Decision interval state
+        self._steps_since_decision = 0
+        self._interval_offset = 0  # Phase offset (randomized in training)
         
         # NEW: Track transaction costs and turnover
         self.transaction_cost_memory = []
@@ -555,307 +563,222 @@ class StockPortfolioSequenceEnv(gym.Env):
 
         if self.terminal:
             # Terminal state - save plots and print statistics
-            df = pd.DataFrame(self.portfolio_return_memory)
-            df.columns = ["daily_return"]
-            plt.plot(df.daily_return.cumsum(), "r")
-            plt.savefig("results/cumulative_reward.png")
-            plt.close()
-
-            plt.plot(self.portfolio_return_memory, "r")
-            plt.savefig("results/rewards.png")
-            plt.close()
-
-            print("=================================")
-            print(f"begin_total_asset:{self.asset_memory[0]}")
-            print(f"end_total_asset:{self.portfolio_value}")
-            
-            # NEW: Report transaction costs and turnover
-            total_transaction_costs = sum(self.transaction_cost_memory)
-            avg_turnover = np.mean(self.turnover_memory) if len(self.turnover_memory) > 0 else 0
-            print(f"total_transaction_costs: {total_transaction_costs:.2f}")
-            print(f"avg_daily_turnover: {avg_turnover:.4f}")
-            print(f"num_rebalances: {len(self.turnover_memory)}")
-
-            df_daily_return = pd.DataFrame(self.portfolio_return_memory)
-            df_daily_return.columns = ["daily_return"]
-            if df_daily_return["daily_return"].std() != 0:
-                sharpe = (
-                    (252**0.5)
-                    * df_daily_return["daily_return"].mean()
-                    / df_daily_return["daily_return"].std()
-                )
-                print("Sharpe: ", sharpe)
-            print("=================================")
-
-            if (self.model_name != "") and (self.mode != ""):
-                df_actions = self.save_action_memory()
-                df_actions.to_csv(
-                    "results/actions_{}_{}_{}_{}.csv".format(
-                        self.mode, self.model_name, self.iteration, self.seed
-                    )
-                )
-
-                df_total_value = pd.DataFrame(self.asset_memory)
-                df_total_value.columns = ["account_value"]
-                df_total_value["date"] = self.date_memory
-                df_total_value["daily_return"] = df_total_value["account_value"].pct_change(1)
-                df_total_value.to_csv(
-                    "results/account_value_{}_{}_{}_{}.csv".format(
-                        self.mode, self.model_name, self.iteration, self.seed
-                    ),
-                    index=False,
-                )
-
+            self._save_terminal_stats()
             return self._get_observation(), self.reward, self.terminal, False, {}
 
         else:
             # ================================================================
-            # STEP 1: Convert actions to portfolio weights
+            # DECISION INTERVAL: Each call to step() processes one decision
+            # followed by (decision_interval - 1) hold days. On hold days
+            # the portfolio drifts with market returns but no action/TC.
+            # This lets the agent train on daily price data while trading
+            # at a lower frequency (e.g., weekly with decision_interval=5).
+            # Backward compatible: decision_interval=1 → original daily behavior.
+            # ================================================================
+            
+            # Determine how many days this step covers.
+            # First step of an episode may use a shorter interval (phase offset).
+            if self._steps_since_decision == 0 and self._interval_offset > 0:
+                # First interval after reset: shortened by offset
+                interval_length = max(1, self._interval_offset)
+            else:
+                interval_length = self.decision_interval
+            
+            # ================================================================
+            # STEP 1: Convert actions to portfolio weights (DECISION DAY)
             # ================================================================
             if self.action_mode == "residual":
-                # Residual: actions are weight deltas from current allocation.
-                # Zero action = hold current weights = zero turnover = zero TC.
-                # This aligns the NN's zero-initialization with the financially
-                # optimal default (hold), so the agent must actively push to trade.
                 proposed_weights = self.current_weights + actions
                 new_weights = self._softmax(proposed_weights)
             else:
                 new_weights = self._softmax(actions)
             
-            # Store old weights before updating
             old_weights = self.current_weights.copy()
             
             # ================================================================
             # STEP 2: Rebalancing Threshold Check (Execution Layer)
             # ================================================================
-            # Calculate turnover BEFORE deciding whether to rebalance
-            # This represents the fraction of portfolio that needs to be traded
+            # Capture pre-TC portfolio value for reward computation.
+            # Using the pre-TC value makes interval_return TC-inclusive:
+            #   return = V_after_market / V_before_TC - 1
+            # This preserves the original reward semantics where TC drag is
+            # implicitly embedded in the return signal, alongside the explicit
+            # TC penalty.  Without this, reward types with low tc_scale (pnl,
+            # log_return, active_return) would lose most of their TC pressure.
+            interval_start_value = self.portfolio_value
+            
             turnover = np.sum(np.abs(new_weights - old_weights))
             
-            # Check if turnover exceeds threshold - if not, skip rebalancing entirely
             if turnover < self.rebalancing_threshold:
-                # Skip rebalancing: keep old weights, pay no transaction costs
                 new_weights = old_weights.copy()
                 turnover = 0.0
                 transaction_cost = 0.0
             else:
-                # Execute rebalancing: calculate and pay transaction costs
-                # Transaction cost as a percentage of the traded amount
-                # If turnover = 0.5 (50% of portfolio traded) and cost_pct = 0.001 (0.1%)
-                # Then total cost = 0.5 * 0.001 * portfolio_value = 0.0005 * portfolio_value
                 transaction_cost = turnover * self.transaction_cost_pct * self.portfolio_value
-                
-                # Apply transaction cost BEFORE calculating returns
-                # This is the correct sequence: pay to rebalance, then earn returns
                 self.portfolio_value -= transaction_cost
             
-            # Track costs and turnover for analysis
             self.transaction_cost_memory.append(transaction_cost)
             self.turnover_memory.append(turnover)
             
-            # Update current weights
             self.current_weights = new_weights
             self.actions_memory.append(new_weights)
             
             # ================================================================
-            # STEP 3: Move to next day and calculate market returns
+            # STEP 3–4: Advance through interval days (market returns)
             # ================================================================
-            last_day_memory = self.data
-            self.day += 1
-            self.data = self.df.loc[self.day, :]
+            total_transaction_cost = transaction_cost  # accumulate TC across interval
             
-            # Calculate portfolio return based on NEW weights
-            # The portfolio is now allocated according to new_weights
-            # and we observe how it performs with today's price changes
-            portfolio_return = sum(
-                ((self.data.close.values / last_day_memory.close.values) - 1) * new_weights
-            )
+            # DSR: accumulate per-day differential Sharpe increments across the interval.
+            # This keeps Moody & Saffell (2001) semantics even when decisions are weekly.
+            dsr_increment_sum = 0.0
+            dsr_increment_count = 0
+            
+            # Track daily price returns for benchmark computation
+            interval_price_returns = []
+            
+            for day_in_interval in range(interval_length):
+                # Advance to next calendar day
+                last_day_memory = self.data
+                self.day += 1
+                
+                # Safety: don't advance past available data
+                n_unique = len(self.df.index.unique())
+                if self.day >= n_unique:
+                    self.day = n_unique - 1
+                    self.terminal = True
+                    break
+                
+                self.data = self.df.loc[self.day, :]
+                
+                # Calculate market returns with current weights
+                price_returns = (self.data.close.values / last_day_memory.close.values) - 1
+                portfolio_return = sum(price_returns * self.current_weights)
+                
+                # Store price returns for benchmark computation
+                interval_price_returns.append(price_returns)
+                
+                assert not np.isnan(portfolio_return), "Portfolio return contains NaN values"
+                assert not np.isinf(portfolio_return), "Portfolio return contains Inf values"
+                
+                new_portfolio_value = self.portfolio_value * (1 + portfolio_return)
+                self.portfolio_value = new_portfolio_value
+                
+                # Update observation buffer
+                new_obs = self._build_daily_observation(self.data, self.day)
+                self.observation_buffer.append(new_obs)
+                self.observation_buffer = self.observation_buffer[-self.sequence_length:]
+                
+                # Save daily records to memory
+                self.portfolio_return_memory.append(portfolio_return)
+                self.date_memory.append(self.data.date.unique()[0])
+                self.asset_memory.append(new_portfolio_value)
+                
+                # Update DSR statistics DAILY (not just on decision days)
+                # This maintains proper 20-day memory for risk estimation
+                # even when making decisions weekly (decision_interval=5)
+                if self.reward_type == "dsr" and len(self.asset_memory) > 1:
+                    prev_a = self.dsr_a
+                    prev_b = self.dsr_b
+                    prev_var = prev_b - prev_a ** 2
 
-            assert not np.isnan(portfolio_return), "Portfolio return contains NaN values"
-            assert not np.isinf(portfolio_return), "Portfolio return contains Inf values"
+                    # EWMA moment updates
+                    self.dsr_a = (1 - self.dsr_eta) * prev_a + self.dsr_eta * portfolio_return
+                    self.dsr_b = (1 - self.dsr_eta) * prev_b + self.dsr_eta * (portfolio_return ** 2)
+
+                    # Differential Sharpe increment (Moody & Saffell 2001)
+                    if prev_var > 1e-12:
+                        delta_a = self.dsr_a - prev_a
+                        delta_b = self.dsr_b - prev_b
+                        dsr_inc = (prev_b * delta_a - 0.5 * prev_a * delta_b) / (prev_var ** 1.5)
+                        dsr_increment_sum += float(dsr_inc)
+                        dsr_increment_count += 1
+                
+                # Drift weights after market returns — applies to ALL days in interval.
+                # After price changes, portfolio composition shifts naturally:
+                #   w_i' = w_i * (1 + r_i) / sum(w_j * (1 + r_j))
+                # This must happen on the decision day too, so that hold day 1
+                # starts with correctly drifted weights.
+                drifted = self.current_weights * (1 + price_returns)
+                weight_sum = drifted.sum()
+                if weight_sum > 1e-10:
+                    self.current_weights = drifted / weight_sum
+                
+                # Record hold-day memory only (decision day already recorded above)
+                if day_in_interval > 0:
+                    self.transaction_cost_memory.append(0.0)
+                    self.turnover_memory.append(0.0)
+                    self.actions_memory.append(self.current_weights.tolist())
+                
+                # Check terminal AFTER computing this day's return
+                self.terminal = self.day >= n_unique - 1
+                if self.terminal:
+                    break
+            
+            self._steps_since_decision += 1
             
             # ================================================================
-            # STEP 4: Update portfolio value with market returns
+            # STEP 5: Calculate reward for the full interval
             # ================================================================
-            # Note: portfolio_value was already reduced by transaction_cost above
-            new_portfolio_value = self.portfolio_value * (1 + portfolio_return)
-            gain = new_portfolio_value - self.portfolio_value
-            self.portfolio_value = new_portfolio_value
-
-            # NEW: Update observation buffer with new state
-            new_obs = self._build_daily_observation(self.data, self.day)
-            self.observation_buffer.append(new_obs)
-            self.observation_buffer = self.observation_buffer[-self.sequence_length:]  # Keep only last N observations
-
-            # Save to memory
-            self.portfolio_return_memory.append(portfolio_return)
-            self.date_memory.append(self.data.date.unique()[0])
-            self.asset_memory.append(new_portfolio_value)
-
-            # ================================================================
-            # STEP 5: Calculate raw reward metric based on reward_type
-            # ================================================================
-            # Reward scaling is applied through a shared transform layer
-            # (EWMA z-score + clipping + reward_scaling) for all reward types.
-            # ================================================================
+            # Use interval-level return for reward computation.
+            # This gives the agent one reward signal per decision, reflecting
+            # the cumulative consequence of that decision over the holding period.
             
-            # EXPLICIT Transaction Cost Penalty (visible to policy)
-            # TC is already subtracted from portfolio_value (financial correctness),
-            # but we add it as an explicit penalty so the policy can learn the
-            # DIRECT connection between its actions and costs.
-            # 
-            # Scale TC penalty to achieve ~10% EXPLICIT impact across reward types.
-            # Return-based rewards already carry ~100-200% IMPLICIT TC (via V_t
-            # reduction), so they need small explicit multipliers (0.05-0.1).
-            # DSR/Sharpe have negligible implicit TC (<1%), so need large
-            # multipliers (15-100x) to make TC visible in the gradient.
+            # EXPLICIT Transaction Cost Penalty
             TC_PENALTY_SCALES = {
-                'log_return': 0.1,    # Implicit TC already ~100% of signal; 0.1 adds ~10% explicit
-                'pnl': 0.1,           # Same as log_return
-                'active_return': 0.05, # Implicit TC already ~200% of signal (agent NET vs bench GROSS); 0.05 adds ~10%
-                'dsr': 15.0,          # DSR typical scale ~0.15 vs TC ~0.001; 15x → ~10% explicit
-                'sharpe': 100.0,      # Sharpe typical scale ~1.0 vs TC ~0.001; 100x → ~10% explicit
+                'dsr': 15.0,
+                'sharpe': 100.0,
             }
-            tc_scale = TC_PENALTY_SCALES.get(self.reward_type, 1.0)
-            explicit_tc_penalty = (transaction_cost / self.initial_amount) * tc_scale
+            # Only apply explicit TC shaping for risk-adjusted rewards (DSR/Sharpe).
+            # For return-based rewards (pnl/log_return/active_return), TC is already
+            # embedded in interval_return via portfolio_value updates.
+            tc_scale = TC_PENALTY_SCALES.get(self.reward_type, 0.0)
+            if self.reward_type in ("dsr", "sharpe"):
+                explicit_tc_penalty = (total_transaction_cost / self.initial_amount) * tc_scale
+            else:
+                explicit_tc_penalty = 0.0
             
-            # Optional turnover penalty (raw-reward space)
-            # Keep in the same unit space as raw_reward, then normalize once.
             turnover_penalty = 0.0
             if turnover > self.turnover_penalty_threshold:
                 turnover_penalty = self.turnover_penalty_coeff * (turnover - self.turnover_penalty_threshold)
             
+            # Interval-level return (includes TC from decision day)
+            interval_return = (self.portfolio_value / (interval_start_value + 1e-10)) - 1
+            
             if self.reward_type == "log_return":
-                # Per-step portfolio log return adapted from Jiang et al. (2017,
-                # arXiv:1706.10059, Eq. 11).
-                #
-                # Original (batch):  R = (1/T) Σ_t ln(μ_t · y_t · w_{t-1})
-                #   y_t  = price relative vector  (close_t / close_{t-1})
-                #   w    = portfolio weight vector chosen at end of t-1
-                #   μ_t  = transaction remainder factor ≈ 1 - c_p · turnover
-                #
-                # Adaptation for online (step-by-step) RL:
-                #   - Emit the per-step log return  ln(μ_t · y_t · w_{t-1})
-                #     as the immediate reward.  Maximising the discounted sum
-                #     of per-step log returns is equivalent to maximising the
-                #     log of terminal wealth (Kelly/growth-optimal criterion).
-                #   - Variance reduction is delegated to _transform_reward
-                #     (EWMA z-score) and PPO's GAE, rather than averaging
-                #     over a rolling window which dilutes credit assignment.
-                #
-                # Caveat vs. original paper:
-                #   Jiang et al. optimise the *episode-level* sum with a
-                #   deterministic policy gradient (EIIE).  Here we emit
-                #   per-step rewards for compatibility with SB3's online
-                #   algorithms (PPO, DDPG, etc.).  The objective is
-                #   mathematically equivalent when γ = 1, but in practice
-                #   γ < 1 down-weights distant future returns.
                 if len(self.asset_memory) > 1:
-                    # Per-step log return: ln(V_t / V_{t-1})
-                    # Computed directly from portfolio value ratio, which
-                    # already incorporates TC (subtracted in Step 2).
-                    # This is numerically identical to the decomposed form
-                    #   ln(μ_t · dot(y_t, w))  where μ_t = 1 - c·turnover
-                    # but avoids any floating-point divergence between paths
-                    # and eliminates the appearance of double-counting TC.
-                    ratio = self.asset_memory[-1] / (self.asset_memory[-2] + 1e-10)
-                    raw_reward = np.log(max(ratio, 1e-10))  # Guard against log(0) or log(negative)
-                    
+                    raw_reward = np.log(max(self.portfolio_value / (interval_start_value + 1e-10), 1e-10))
                     self.log_return_memory.append(raw_reward)
                 else:
                     raw_reward = 0.0
             
             elif self.reward_type == "dsr":
-                # Differential Sharpe Ratio — Moody & Saffell (2001), Eq. 9:
-                #   DSR_t = (B_{t-1} · ΔA_t  -  0.5 · A_{t-1} · ΔB_t)
-                #           / (B_{t-1} - A_{t-1}²)^{3/2}
-                #
-                # A_t = EMA of returns,  B_t = EMA of squared returns.
-                # The formula uses the PREVIOUS moments (t-1) because DSR is
-                # the derivative of the Sharpe ratio w.r.t. the new return,
-                # evaluated at the state *before* observing R_t.
-                if len(self.asset_memory) > 1:
-                    current_return = (self.asset_memory[-1] / (self.asset_memory[-2] + 1e-10)) - 1
-                    
-                    prev_a = self.dsr_a
-                    prev_b = self.dsr_b
-                    
-                    # Update exponential moving averages
-                    self.dsr_a = (1 - self.dsr_eta) * prev_a + self.dsr_eta * current_return
-                    self.dsr_b = (1 - self.dsr_eta) * prev_b + self.dsr_eta * (current_return ** 2)
-                    
-                    # Calculate deltas
-                    delta_a = self.dsr_a - prev_a  # = eta * (R_t - prev_a)
-                    delta_b = self.dsr_b - prev_b  # = eta * (R_t² - prev_b)
-                    
-                    # Variance from PREVIOUS moments (Moody & Saffell 2001, Eq. 9)
-                    variance = prev_b - prev_a ** 2
-                    
-                    if variance > 1e-12:
-                        dsr = (prev_b * delta_a - 0.5 * prev_a * delta_b) / (variance ** 1.5)
-                        raw_reward = dsr
-                    else:
-                        # Warmup: variance not yet reliable. Emit 0 to avoid scale
-                        # discontinuity (DSR ~ O(0.1-1) vs current_return ~ O(10⁻³)).
-                        # The EWMA normalization will handle the warmup period gracefully.
-                        raw_reward = 0.0
+                # Differential Sharpe Ratio (Moody & Saffell, 2001)
+                # Accumulated daily DSR increments across the interval.
+                if dsr_increment_count > 0:
+                    # Average to keep reward magnitude stable when interval_length changes.
+                    raw_reward = dsr_increment_sum / dsr_increment_count
                 else:
                     raw_reward = 0.0
             
             elif self.reward_type == "active_return":
-                # Excess return over equal-weight benchmark
-                # 
-                # Benchmark Strategy: 1/N equal-weight allocation
-                # Default: Benchmark is GROSS (no TC), Agent is NET (includes TC)
-                # Rationale: Equal-weight indices typically rebalance infrequently
-                # (monthly/quarterly), so daily TC is negligible. This follows
-                # industry standard for evaluating active management.
-                # 
-                # For symmetric comparison, benchmark TC can be calculated as:
-                # Equal-weight drift due to price changes causes weight deviations,
-                # rebalancing back to 1/N incurs turnover costs.
-                price_returns = (self.data.close.values / np.maximum(last_day_memory.close.values, 1e-10)) - 1
-                benchmark_gross_return = np.mean(price_returns)
-                
-                # Optional: Calculate benchmark transaction costs if rebalancing to equal weights
-                # Uncomment below to include benchmark TC for symmetric comparison:
-                # if len(self.asset_memory) > 1:
-                #     # After price changes, weights drift from equal-weight
-                #     benchmark_weights_after_drift = np.ones(self.stock_dim) / self.stock_dim
-                #     benchmark_weights_after_drift *= (1 + price_returns)
-                #     benchmark_weights_after_drift /= benchmark_weights_after_drift.sum()
-                #     # Turnover to rebalance back to equal weights
-                #     target_weights = np.ones(self.stock_dim) / self.stock_dim
-                #     benchmark_turnover = np.sum(np.abs(target_weights - benchmark_weights_after_drift))
-                #     benchmark_tc = benchmark_turnover * self.transaction_cost_pct
-                #     benchmark_net_return = benchmark_gross_return - benchmark_tc
-                # else:
-                #     benchmark_net_return = benchmark_gross_return
-                
-                # Use agent NET return (TC already applied to portfolio_value)
-                agent_return = (self.asset_memory[-1] / (self.asset_memory[-2] + 1e-10)) - 1
-                
-                # Active return: Agent NET vs Benchmark GROSS (default, conservative)
-                active_return = agent_return - benchmark_gross_return
-                # Alternatively, for symmetric comparison: agent_return - benchmark_net_return
-                
-                raw_reward = active_return
+                # Active return = agent return - equal-weight benchmark return
+                # Benchmark: equal-weight portfolio of all assets
+                if len(self.asset_memory) > 1 and len(interval_price_returns) > 0:
+                    # Compute equal-weight benchmark return over the interval
+                    # Option 1: Compound daily returns (more accurate)
+                    benchmark_value = 1.0
+                    equal_weights = np.ones(self.stock_dim) / self.stock_dim
+                    for daily_returns in interval_price_returns:
+                        benchmark_daily_return = np.sum(daily_returns * equal_weights)
+                        benchmark_value *= (1 + benchmark_daily_return)
+                    benchmark_return = benchmark_value - 1.0
+                    
+                    # Active return = agent interval return - benchmark interval return
+                    raw_reward = interval_return - benchmark_return
+                else:
+                    raw_reward = 0.0
             
             elif self.reward_type == "sharpe":
-                # Rolling Sharpe ratio using NET returns (TC-adjusted)
-                #
-                # Window size (sharpe_window, default 21 ≈ 1 month):
-                #   - Balances statistical reliability vs. credit assignment
-                #   - Current action contributes ~1/window to the signal
-                #   - Consider DSR for sharper per-step credit assignment
-                #
-                # Design choices:
-                #   - ddof=1 for unbiased std estimate on small windows
-                #   - No √252 annualization: _transform_reward handles scaling;
-                #     annualisation inflates magnitude without adding info
-                #   - Warmup emits 0 to avoid scale discontinuity (warmup
-                #     net-return ≈ O(0.001) vs Sharpe ≈ O(0.5–2) is a ~1000×
-                #     jump that destabilises the EWMA normaliser)
                 if len(self.asset_memory) >= self.sharpe_window:
                     recent_values = self.asset_memory[-self.sharpe_window:]
                     recent_net_returns = [
@@ -869,37 +792,23 @@ class StockPortfolioSequenceEnv(gym.Env):
                     else:
                         raw_reward = 0.0
                 else:
-                    # Warmup: not enough history for reliable Sharpe estimate.
-                    # Use None to signal that normalization should be skipped
-                    # (avoids corrupting EWMA stats with zeros during warmup).
                     raw_reward = None
             
             elif self.reward_type == "pnl":
-                # Day-over-day portfolio percentage return (scale-invariant,
-                # includes TC drag via portfolio_value adjustment in step 2).
-                # NOTE: Named 'pnl' for backward compatibility; the actual
-                # quantity is (V_t / V_{t-1}) - 1, not dollar PnL.
                 if len(self.asset_memory) > 1:
-                    raw_reward = (self.asset_memory[-1] / (self.asset_memory[-2] + 1e-10)) - 1
+                    raw_reward = interval_return
                 else:
                     raw_reward = 0.0
             
             else:
                 raise ValueError(f"Unknown reward_type: {self.reward_type}")
 
-            # Handle explicit TC penalty, turnover penalty, and reward transformation
-            # Special case: Sharpe warmup returns None to skip normalization
+            # Handle penalties and reward transformation
             if raw_reward is None:
-                # Warmup period for Sharpe — not enough history for reliable estimate.
-                # Emit 0 reward: avoids corrupting EWMA stats (which would adapt to
-                # return-scale ~10⁻³, then face ~1000× scale jump when real Sharpe
-                # values ~O(1) begin flowing). Cost: agent learns nothing for ~21
-                # steps per episode (negligible for multi-year episodes).
                 self.reward = 0.0
                 self.raw_reward_memory.append(0.0)
                 self.scaled_reward_memory.append(0.0)
             else:
-                # Apply penalties BEFORE transformation so they get normalized together
                 raw_reward = raw_reward - explicit_tc_penalty - turnover_penalty
                 transformed_reward = self._transform_reward(raw_reward)
                 self.reward = transformed_reward
@@ -908,6 +817,10 @@ class StockPortfolioSequenceEnv(gym.Env):
             
             assert not np.isnan(self.reward), "Reward contains NaN values"
             assert not np.isinf(self.reward), "Reward contains Inf values"
+
+            # If terminal was detected during interval loop, save stats
+            if self.terminal:
+                self._save_terminal_stats()
 
             # Validate observation
             observation = self._get_observation()
@@ -951,6 +864,16 @@ class StockPortfolioSequenceEnv(gym.Env):
         # Reset log return memory
         self.log_return_memory = []
         
+        # Decision interval: randomize phase offset during training
+        # so agent doesn't overfit to a fixed weekday pattern.
+        # First step is always a decision day (deploy from cash / evaluate after handoff).
+        # Offset shifts SUBSEQUENT decisions: next decision at offset, then every interval after.
+        if self.randomize_interval_offset and self.decision_interval > 1:
+            self._interval_offset = np.random.randint(0, self.decision_interval)
+        else:
+            self._interval_offset = 0
+        self._steps_since_decision = 0
+        
         # RC6: Random start position for training diversity
         n_days = len(self.df.index.unique())
         if self.random_start and n_days > self.sequence_length + 10:
@@ -980,6 +903,62 @@ class StockPortfolioSequenceEnv(gym.Env):
             "portfolio_value": self.portfolio_value,
             "current_weights": self.current_weights.copy(),
         }
+
+    def _save_terminal_stats(self):
+        """Save terminal statistics, plots, and CSVs.
+        
+        Called when the episode ends — either from the terminal branch at the
+        top of step() or when terminal is detected inside the decision interval loop.
+        """
+        df = pd.DataFrame(self.portfolio_return_memory)
+        df.columns = ["daily_return"]
+        plt.plot(df.daily_return.cumsum(), "r")
+        plt.savefig("results/cumulative_reward.png")
+        plt.close()
+
+        plt.plot(self.portfolio_return_memory, "r")
+        plt.savefig("results/rewards.png")
+        plt.close()
+
+        print("=================================")
+        print(f"begin_total_asset:{self.asset_memory[0]}")
+        print(f"end_total_asset:{self.portfolio_value}")
+
+        total_transaction_costs = sum(self.transaction_cost_memory)
+        avg_turnover = np.mean(self.turnover_memory) if len(self.turnover_memory) > 0 else 0
+        print(f"total_transaction_costs: {total_transaction_costs:.2f}")
+        print(f"avg_daily_turnover: {avg_turnover:.4f}")
+        print(f"num_rebalances: {len(self.turnover_memory)}")
+
+        df_daily_return = pd.DataFrame(self.portfolio_return_memory)
+        df_daily_return.columns = ["daily_return"]
+        if df_daily_return["daily_return"].std() != 0:
+            sharpe = (
+                (252**0.5)
+                * df_daily_return["daily_return"].mean()
+                / df_daily_return["daily_return"].std()
+            )
+            print("Sharpe: ", sharpe)
+        print("=================================")
+
+        if (self.model_name != "") and (self.mode != ""):
+            df_actions = self.save_action_memory()
+            df_actions.to_csv(
+                "results/actions_{}_{}_{}_{}.csv".format(
+                    self.mode, self.model_name, self.iteration, self.seed
+                )
+            )
+
+            df_total_value = pd.DataFrame(self.asset_memory)
+            df_total_value.columns = ["account_value"]
+            df_total_value["date"] = self.date_memory
+            df_total_value["daily_return"] = df_total_value["account_value"].pct_change(1)
+            df_total_value.to_csv(
+                "results/account_value_{}_{}_{}_{}.csv".format(
+                    self.mode, self.model_name, self.iteration, self.seed
+                ),
+                index=False,
+            )
 
     def _softmax(self, actions):
         """Project a vector onto the probability simplex (non-negative, sum=1).

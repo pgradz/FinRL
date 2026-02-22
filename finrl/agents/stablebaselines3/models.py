@@ -1187,6 +1187,7 @@ class DRLAgent:
         if norm_stats is not None:
             val_env_kwargs['normalization_stats'] = norm_stats
         val_env_kwargs['random_start'] = False  # Deterministic evaluation
+        val_env_kwargs['randomize_interval_offset'] = False  # Fixed phase in evaluation
         val_env_gym = env_constructor(val_df, **val_env_kwargs)
         env_val, _ = val_env_gym.get_sb_env()
 
@@ -1472,6 +1473,7 @@ class DRLAgent:
             if norm_stats is not None:
                 val_kwargs['normalization_stats'] = norm_stats
             val_kwargs['random_start'] = False  # Deterministic evaluation
+            val_kwargs['randomize_interval_offset'] = False  # Fixed phase in evaluation
             val_env_gym = env_constructor(val_df, **val_kwargs)
             env_val, _ = val_env_gym.get_sb_env()
             env_val.seed(seed)
@@ -1524,6 +1526,7 @@ class DRLAgent:
             if norm_stats is not None:
                 val_final_kwargs['normalization_stats'] = norm_stats
             val_final_kwargs['random_start'] = False  # Deterministic evaluation
+            val_final_kwargs['randomize_interval_offset'] = False  # Fixed phase in evaluation
             val_env_gym_final = env_constructor(
                 val_df,
                 iteration=iteration_no,
@@ -1544,6 +1547,7 @@ class DRLAgent:
             if norm_stats is not None:
                 val_ckpt_kwargs['normalization_stats'] = norm_stats
             val_ckpt_kwargs['random_start'] = False  # Deterministic evaluation
+            val_ckpt_kwargs['randomize_interval_offset'] = False  # Fixed phase in evaluation
             val_env_gym_ckpt = env_constructor(
                 val_df,
                 iteration=iteration_no,
@@ -1604,6 +1608,7 @@ class DRLAgent:
             if norm_stats is not None:
                 trade_kwargs['normalization_stats'] = norm_stats
             trade_kwargs['random_start'] = False  # Deterministic evaluation for OOS trading
+            trade_kwargs['randomize_interval_offset'] = False  # Fixed phase in trading
             trade_env_gym = env_constructor(trade_df, **trade_kwargs, initial=initial, previous_state=last_state)
             account_mem, actions_mem, last_state = self.DRL_prediction(best_policy, trade_env_gym, deterministic=True)
 
@@ -1691,40 +1696,47 @@ class DRLAgent:
 
     @staticmethod
     def DRL_prediction(model, environment, deterministic=True):
-        """make a prediction and get results"""
-        test_env, test_obs = environment.get_sb_env()
-        account_memory = None  # This help avoid unnecessary list creation
-        actions_memory = None  # optimize memory consumption
-        # state_memory=[] #add memory pool to store states
+        """Make a prediction and get results.
 
-        test_env.reset()
-        max_steps = len(environment.df.index.unique()) - 1
+        Uses the raw environment directly (not DummyVecEnv) to avoid
+        auto-reset on episode termination, which would clear the
+        environment's memory arrays before they can be saved.  This is
+        essential when step() returns done=True within a single call
+        (e.g., with decision_interval > 1, where each step() advances
+        multiple calendar days and can hit the terminal day mid-interval).
+        """
+        obs, _ = environment.reset()
 
-        for i in range(len(environment.df.index.unique())):
-            action, _states = model.predict(test_obs, deterministic=deterministic)
-            test_obs, rewards, dones, info = test_env.step(action)
+        done = False
+        max_steps = len(environment.df.index.unique())  # safety limit
+        step_count = 0
 
-            if i == max_steps - 1 or dones[0]:
-                # Save memory at end of episode (either natural end or early termination)
-                account_memory = test_env.env_method(method_name="save_asset_memory")
-                actions_memory = test_env.env_method(method_name="save_action_memory")
-                # Use get_terminal_state() for explicit portfolio_value & weights handoff
-                # (render() returns normalized observation which can't be parsed for portfolio_value)
-                inner_env = test_env.envs[0]
-                if hasattr(inner_env, 'get_terminal_state'):
-                    last_state = inner_env.get_terminal_state()
-                else:
-                    last_state = inner_env.render()  # legacy fallback
-                if dones[0]:
-                    print("hit end!")
-                break
+        while not done and step_count < max_steps:
+            action, _states = model.predict(obs, deterministic=deterministic)
+            obs, reward, terminated, truncated, info = environment.step(action)
+            done = terminated or truncated
+            step_count += 1
 
-        if account_memory is None:
+        if not done:
             raise RuntimeError(
-                f"DRL_prediction: episode never terminated. "
-                f"max_steps={max_steps}, iterations={i}"
+                f"DRL_prediction: episode never terminated after {step_count} steps. "
+                f"max_steps={max_steps}"
             )
-        return account_memory[0], actions_memory[0], last_state
+
+        print("hit end!")
+
+        # Environment memory is intact (no DummyVecEnv auto-reset)
+        account_memory = environment.save_asset_memory()
+        actions_memory = environment.save_action_memory()
+
+        # Use get_terminal_state() for explicit portfolio_value & weights handoff
+        # (render() returns normalized observation which can't be parsed for portfolio_value)
+        if hasattr(environment, 'get_terminal_state'):
+            last_state = environment.get_terminal_state()
+        else:
+            last_state = environment.render()  # legacy fallback
+
+        return account_memory, actions_memory, last_state
 
     @staticmethod
     def DRL_prediction_load_from_file(model_name, environment, cwd, deterministic=True):
