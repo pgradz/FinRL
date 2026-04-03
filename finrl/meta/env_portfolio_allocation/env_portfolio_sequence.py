@@ -78,6 +78,7 @@ class StockPortfolioSequenceEnv(gym.Env):
         rebalancing_threshold: float = 0.0,  # Minimum turnover required to execute rebalancing (default: 0.0 = always rebalance)
         turnover_penalty_threshold: float = 0.20,  # Penalty-free daily turnover (~10% reallocation)
         turnover_penalty_coeff: float = 0.0,  # Set to 0.0 to disable (default); use >0 to penalize excessive turnover
+        post_norm_tc_coeff: float = 0.0,  # Post-normalization TC penalty: applied AFTER EWMA z-score, before reward_scaling. 0.0 = disabled.
         action_mode: str = "absolute",  # "absolute" = target weights, "residual" = weight deltas (zero action = hold)
         decision_interval: int = 1,  # Act every N trading days (1=daily, 5=weekly). Hold days advance prices but skip action/TC.
         randomize_interval_offset: bool = False,  # Training: randomize phase so agent doesn't overfit to a fixed weekday
@@ -111,6 +112,8 @@ class StockPortfolioSequenceEnv(gym.Env):
             rebalancing_threshold: Minimum turnover required to execute rebalancing (default: 0.0 = always rebalance)
             turnover_penalty_threshold: Turnover threshold before penalty applies (default: 0.20)
             turnover_penalty_coeff: Penalty coefficient (default: 0.0 = disabled)
+            post_norm_tc_coeff: Unified TC penalty applied in normalized reward space (after EWMA z-score).
+                Set >0 (e.g. 1.0) to penalize TC uniformly across all reward types.
         """
         self.day = day
         self.lookback = lookback
@@ -143,6 +146,7 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.rebalancing_threshold = rebalancing_threshold
         self.turnover_penalty_threshold = turnover_penalty_threshold
         self.turnover_penalty_coeff = turnover_penalty_coeff
+        self.post_norm_tc_coeff = post_norm_tc_coeff
         self.action_mode = action_mode
         self.decision_interval = max(1, int(decision_interval))
         self.randomize_interval_offset = randomize_interval_offset
@@ -319,14 +323,14 @@ class StockPortfolioSequenceEnv(gym.Env):
             "var": float(self._reward_var),
         }
 
-    def _transform_reward(self, raw_reward: float) -> float:
+    def _transform_reward(self, raw_reward: float, tc_fraction: float = 0.0) -> float:
         """Apply optional reward normalization and global scaling.
         
         Purpose: Bring different reward types (return, Sharpe, DSR, log returns) to
         similar scale for stable policy gradient learning.
         
         Pipeline:
-            raw_reward -> (optional EWMA z-score + clipping) -> reward_scaling
+            raw_reward -> (optional EWMA z-score + clipping) -> post-norm TC penalty -> reward_scaling
         
         Hyperparameter Guidance:
         ------------------------
@@ -345,7 +349,11 @@ class StockPortfolioSequenceEnv(gym.Env):
         raw_reward = float(raw_reward)
 
         if self.reward_transform == "none":
-            return raw_reward * self.reward_scaling
+            # Even with no normalization, apply post-norm TC penalty if enabled
+            reward = raw_reward
+            if self.post_norm_tc_coeff > 0:
+                reward -= self.post_norm_tc_coeff * tc_fraction
+            return reward * self.reward_scaling
 
         if self.reward_transform != "ewma_zscore":
             raise ValueError(f"Unknown reward_transform: {self.reward_transform}")
@@ -371,6 +379,13 @@ class StockPortfolioSequenceEnv(gym.Env):
         reward_std = np.sqrt(max(self._reward_var, 1e-8))
         normalized_reward = (raw_reward - centering_mean) / reward_std
         normalized_reward = float(np.clip(normalized_reward, -self.reward_clip, self.reward_clip))
+
+        # Post-normalization TC penalty: applied in the normalized O(1) reward
+        # space so that the same coeff works identically across all reward types.
+        # tc_fraction is dimensionless (total_TC / initial_amount, ~0.001 per rebalance).
+        if self.post_norm_tc_coeff > 0:
+            normalized_reward -= self.post_norm_tc_coeff * tc_fraction
+
         return normalized_reward * self.reward_scaling
 
     def _initialize_observation_buffer(self):
@@ -827,7 +842,9 @@ class StockPortfolioSequenceEnv(gym.Env):
                 self.scaled_reward_memory.append(0.0)
             else:
                 raw_reward = raw_reward - explicit_tc_penalty - turnover_penalty
-                transformed_reward = self._transform_reward(raw_reward)
+                # Pass TC fraction so _transform_reward can apply post-norm penalty
+                tc_fraction = total_transaction_cost / (self.initial_amount + 1e-10)
+                transformed_reward = self._transform_reward(raw_reward, tc_fraction=tc_fraction)
                 self.reward = transformed_reward
                 self.raw_reward_memory.append(float(raw_reward))
                 self.scaled_reward_memory.append(float(self.reward))
