@@ -681,9 +681,23 @@ class StockPortfolioSequenceEnv(gym.Env):
                     prev_b = self.dsr_b
                     prev_var = prev_b - prev_a ** 2
 
+                    # Use TC-inclusive net return on the decision day so DSR
+                    # naturally penalises excessive turnover without an arbitrary
+                    # tc_scale hyperparameter.  On hold days (no TC), this equals
+                    # the gross market return.
+                    #   net_ret = V_after_market / V_before_TC - 1
+                    #           = (post_TC * (1+r)) / pre_TC - 1
+                    if day_in_interval == 0 and interval_start_value > 0:
+                        dsr_return = (new_portfolio_value / interval_start_value) - 1
+                    else:
+                        dsr_return = portfolio_return
+
+                    # --- ORIGINAL (gross market return, TC-blind): ---
+                    # dsr_return = portfolio_return
+
                     # EWMA moment updates
-                    self.dsr_a = (1 - self.dsr_eta) * prev_a + self.dsr_eta * portfolio_return
-                    self.dsr_b = (1 - self.dsr_eta) * prev_b + self.dsr_eta * (portfolio_return ** 2)
+                    self.dsr_a = (1 - self.dsr_eta) * prev_a + self.dsr_eta * dsr_return
+                    self.dsr_b = (1 - self.dsr_eta) * prev_b + self.dsr_eta * (dsr_return ** 2)
 
                     # Differential Sharpe increment (Moody & Saffell 2001)
                     if prev_var > 1e-12:
@@ -723,19 +737,22 @@ class StockPortfolioSequenceEnv(gym.Env):
             # This gives the agent one reward signal per decision, reflecting
             # the cumulative consequence of that decision over the holding period.
             
-            # EXPLICIT Transaction Cost Penalty
-            TC_PENALTY_SCALES = {
-                'dsr': 15.0,
-                'sharpe': 100.0,
-            }
-            # Only apply explicit TC shaping for risk-adjusted rewards (DSR/Sharpe).
-            # For return-based rewards (pnl/log_return/active_return), TC is already
-            # embedded in interval_return via portfolio_value updates.
-            tc_scale = TC_PENALTY_SCALES.get(self.reward_type, 0.0)
-            if self.reward_type in ("dsr", "sharpe"):
-                explicit_tc_penalty = (total_transaction_cost / self.initial_amount) * tc_scale
-            else:
-                explicit_tc_penalty = 0.0
+            # Transaction costs are embedded in portfolio_value for ALL reward
+            # types: interval_return and asset_memory naturally reflect TC drag.
+            # DSR additionally uses TC-inclusive net returns in its EWMA moments
+            # (see decision-day branch above), so no explicit penalty is needed.
+            explicit_tc_penalty = 0.0
+
+            # --- ORIGINAL (arbitrary tc_scale explicit penalty): ---
+            # TC_PENALTY_SCALES = {
+            #     'dsr': 15.0,
+            #     'sharpe': 100.0,
+            # }
+            # tc_scale = TC_PENALTY_SCALES.get(self.reward_type, 0.0)
+            # if self.reward_type in ("dsr", "sharpe"):
+            #     explicit_tc_penalty = (total_transaction_cost / self.initial_amount) * tc_scale
+            # else:
+            #     explicit_tc_penalty = 0.0
             
             turnover_penalty = 0.0
             if turnover > self.turnover_penalty_threshold:
