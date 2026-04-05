@@ -271,8 +271,11 @@ class StockPortfolioSequenceEnv(gym.Env):
         self._initialize_observation_buffer()
 
         # NEW: Initialize state for Differential Sharpe Ratio
+        # dsr_b is warm-started with the empirical variance prior so prev_var is
+        # non-negligible from step 1, preventing O(10²-10³) DSR spikes that
+        # corrupt _reward_var for 50-100 steps at the start of every episode.
         self.dsr_a = 0.0
-        self.dsr_b = 0.0
+        self.dsr_b = REWARD_VAR_DEFAULTS.get('dsr', 0.01)
         
         # Initialize log return memory for log_return reward
         self.log_return_memory = []
@@ -891,9 +894,10 @@ class StockPortfolioSequenceEnv(gym.Env):
         self.turnover_memory = []
         self.cost_memory = [0]
 
-        # Reset DSR states
+        # Reset DSR states — warm-start dsr_b with variance prior to prevent
+        # O(10²-10³) DSR increment spikes at the start of every episode.
         self.dsr_a = 0.0
-        self.dsr_b = 0.0
+        self.dsr_b = REWARD_VAR_DEFAULTS.get('dsr', 0.01)
         
         # Reset log return memory
         self.log_return_memory = []
@@ -976,13 +980,16 @@ class StockPortfolioSequenceEnv(gym.Env):
         print("=================================")
 
         if (self.model_name != "") and (self.mode != ""):
-            df_actions = self.save_action_memory()
-            df_actions.to_csv(
-                "results/actions_{}_{}_{}_{}.csv".format(
-                    self.mode, self.model_name, self.iteration, self.seed
-                )
-            )
+            # Intermediate per-iteration actions CSVs are not needed as output files.
+            # df_actions = self.save_action_memory()
+            # df_actions.to_csv(
+            #     "results/actions_{}_{}_{}_{}.csv".format(
+            #         self.mode, self.model_name, self.iteration, self.seed
+            #     )
+            # )
 
+            # account_value CSV is required by get_validation_sharpe_custom() in models.py
+            # to compare final vs checkpoint models during walk-forward selection.
             df_total_value = pd.DataFrame(self.asset_memory)
             df_total_value.columns = ["account_value"]
             df_total_value["date"] = self.date_memory

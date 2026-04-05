@@ -251,7 +251,7 @@ class TensorboardCallback(BaseCallback):
 
 
 class CustomLSTM(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Box, lstm_hidden_size=64, num_layers=1, dropout=0.0):
+    def __init__(self, observation_space: gym.spaces.Box, lstm_hidden_size=64, num_layers=1, dropout=0.1):
         """
         Custom LSTM feature extractor for Stable-Baselines3.
         
@@ -259,7 +259,7 @@ class CustomLSTM(BaseFeaturesExtractor):
             observation_space: The observation space (should be Box with shape compatible with LSTM)
             lstm_hidden_size: Hidden size of the LSTM layer
             num_layers: Number of LSTM layers
-            dropout: Dropout rate for LSTM (if num_layers > 1)
+            dropout: Dropout rate for LSTM output and inter-layer (if num_layers > 1)
         """
         super().__init__(observation_space, features_dim=lstm_hidden_size)
 
@@ -291,6 +291,9 @@ class CustomLSTM(BaseFeaturesExtractor):
             dropout=dropout if num_layers > 1 else 0.0,
             batch_first=True
         )
+
+        # Output dropout to match regularization level of CNN/Transformer/CNN-LSTM
+        self.output_dropout = nn.Dropout(dropout)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         """
@@ -331,6 +334,7 @@ class CustomLSTM(BaseFeaturesExtractor):
         # Option 2 (alternative): Use final hidden state
         # features = h_n[-1, :, :]  # Shape: (batch_size, lstm_hidden_size)
         
+        features = self.output_dropout(features)
         return features
 
 
