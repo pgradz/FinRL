@@ -1192,6 +1192,7 @@ class DRLAgent:
             val_env_kwargs['normalization_stats'] = norm_stats
         val_env_kwargs['random_start'] = False  # Deterministic evaluation
         val_env_kwargs['randomize_interval_offset'] = False  # Fixed phase in evaluation
+        val_env_kwargs['update_reward_stats'] = False  # Freeze: consistent reward scale across all HPO candidates
         val_env_gym = env_constructor(val_df, **val_env_kwargs)
         env_val, _ = val_env_gym.get_sb_env()
 
@@ -1465,19 +1466,26 @@ class DRLAgent:
 
             # Build train env
             train_env_gym = env_constructor(train_df, **env_kwargs)
-            # Extract normalization stats from training data to prevent data leakage
+            # Extract normalization and reward stats from training data to prevent data leakage
             norm_stats = None
             if hasattr(train_env_gym, 'get_normalization_stats'):
                 norm_stats = train_env_gym.get_normalization_stats()
+            reward_stats = None
+            if hasattr(train_env_gym, 'get_reward_stats'):
+                reward_stats = train_env_gym.get_reward_stats()
             env_train, _ = train_env_gym.get_sb_env()
             env_train.seed(seed)
 
-            # Build val env (with training normalization stats to prevent data leakage)
+            # Build val env (with training stats to prevent data leakage and frozen normalizer
+            # so EvalCallback reward scale is consistent across all checkpoint comparisons)
             val_kwargs = dict(**env_kwargs)
             if norm_stats is not None:
                 val_kwargs['normalization_stats'] = norm_stats
+            if reward_stats is not None:
+                val_kwargs['reward_stats'] = reward_stats
             val_kwargs['random_start'] = False  # Deterministic evaluation
             val_kwargs['randomize_interval_offset'] = False  # Fixed phase in evaluation
+            val_kwargs['update_reward_stats'] = False  # Freeze: consistent reward scale for checkpoint selection
             val_env_gym = env_constructor(val_df, **val_kwargs)
             env_val, _ = val_env_gym.get_sb_env()
             env_val.seed(seed)
@@ -1531,6 +1539,7 @@ class DRLAgent:
                 val_final_kwargs['normalization_stats'] = norm_stats
             val_final_kwargs['random_start'] = False  # Deterministic evaluation
             val_final_kwargs['randomize_interval_offset'] = False  # Fixed phase in evaluation
+            val_final_kwargs['update_reward_stats'] = False  # Freeze: Sharpe scored from CSV, not reward signal
             val_env_gym_final = env_constructor(
                 val_df,
                 iteration=iteration_no,
@@ -1552,6 +1561,7 @@ class DRLAgent:
                 val_ckpt_kwargs['normalization_stats'] = norm_stats
             val_ckpt_kwargs['random_start'] = False  # Deterministic evaluation
             val_ckpt_kwargs['randomize_interval_offset'] = False  # Fixed phase in evaluation
+            val_ckpt_kwargs['update_reward_stats'] = False  # Freeze: Sharpe scored from CSV, not reward signal
             val_env_gym_ckpt = env_constructor(
                 val_df,
                 iteration=iteration_no,
@@ -1613,6 +1623,7 @@ class DRLAgent:
                 trade_kwargs['normalization_stats'] = norm_stats
             trade_kwargs['random_start'] = False  # Deterministic evaluation for OOS trading
             trade_kwargs['randomize_interval_offset'] = False  # Fixed phase in trading
+            trade_kwargs['update_reward_stats'] = False  # Freeze: reward not used during deployment
             trade_env_gym = env_constructor(trade_df, **trade_kwargs, initial=initial, previous_state=last_state)
             account_mem, actions_mem, last_state = self.DRL_prediction(best_policy, trade_env_gym, deterministic=True)
 
